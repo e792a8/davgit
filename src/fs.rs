@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::error;
 
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -12,62 +10,27 @@ use dav_server::fs::{
 };
 use futures_util::stream;
 
-use crate::git_bridge::GitRepo;
+use crate::git::GitRepo;
 
-type WriteCtx = (Arc<GitRepo>, Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>);
+// ---------------------------------------------------------------------------
+// GitDavFs
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct GitDavFs {
-    tree: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
     git: Arc<GitRepo>,
 }
 
 impl GitDavFs {
-    pub fn new(tree: HashMap<PathBuf, Vec<u8>>, git: GitRepo) -> Self {
+    pub fn new(git: GitRepo) -> Self {
         GitDavFs {
-            tree: Arc::new(RwLock::new(tree)),
             git: Arc::new(git),
-        }
-    }
-
-    fn refresh_if_stale(&self) {
-        match self.git.refresh_tree() {
-            Ok(Some(new_tree)) => {
-                *self.tree.write().unwrap() = new_tree;
-            }
-            Ok(None) => {}
-            Err(e) => error!("failed to refresh tree: {}", e),
         }
     }
 
     fn davpath_to_pathbuf(&self, path: &DavPath) -> PathBuf {
         let s = path.as_pathbuf();
         s.strip_prefix("/").unwrap_or(&s).to_path_buf()
-    }
-
-    fn is_dir(&self, path: &Path) -> bool {
-        let tree = self.tree.read().unwrap();
-        if path.as_os_str().is_empty() {
-            return true;
-        }
-        if tree.contains_key(path) {
-            return false;
-        }
-        let mut prefix = path.to_path_buf();
-        prefix.push("");
-        tree.keys().any(|k| k.starts_with(&prefix))
-    }
-
-    fn file_exists(&self, path: &Path) -> bool {
-        let tree = self.tree.read().unwrap();
-        tree.contains_key(path)
-    }
-
-    fn commit_delete(&self, path: &Path) -> Result<(), FsError> {
-        self.git.delete_path(path).map_err(|e| {
-            tracing::error!("git delete failed: {}", e);
-            FsError::GeneralFailure
-        })
     }
 }
 
@@ -78,35 +41,30 @@ impl DavFileSystem for GitDavFs {
         options: OpenOptions,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
-            self.refresh_if_stale();
+            self.git.refresh_if_stale();
             let p = self.davpath_to_pathbuf(path);
 
             if options.write {
                 let data = if options.truncate || options.create {
                     Vec::new()
                 } else {
-                    self.tree
-                        .read()
-                        .unwrap()
-                        .get(&p)
-                        .cloned()
+                    self.git
+                        .read_file(&p)
+                        .ok()
+                        .flatten()
                         .unwrap_or_default()
                 };
-                Ok(Box::new(GitDavFile::new(
-                    data,
-                    p,
-                    true,
-                    Some((self.git.clone(), self.tree.clone())),
-                )) as Box<dyn DavFile>)
+                Ok(Box::new(GitDavFile::new(data, p, self.git.clone()))
+                    as Box<dyn DavFile>)
             } else {
                 let data = self
-                    .tree
-                    .read()
-                    .unwrap()
-                    .get(&p)
-                    .cloned()
+                    .git
+                    .read_file(&p)
+                    .ok()
+                    .flatten()
                     .ok_or(FsError::NotFound)?;
-                Ok(Box::new(GitDavFile::new(data, p, false, None)) as Box<dyn DavFile>)
+                Ok(Box::new(GitDavFile::new(data, p, self.git.clone()))
+                    as Box<dyn DavFile>)
             }
         })
     }
@@ -117,78 +75,38 @@ impl DavFileSystem for GitDavFs {
         _meta: ReadDirMeta,
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
-            self.refresh_if_stale();
+            self.git.refresh_if_stale();
             let p = self.davpath_to_pathbuf(path);
-            let tree = self.tree.read().unwrap();
 
-            let prefix = if p.as_os_str().is_empty() {
-                PathBuf::new()
-            } else {
-                let mut pp = p.clone();
-                pp.push("");
-                pp
-            };
+            let entries = self.git.list_dir(&p).map_err(|e| {
+                tracing::error!("list_dir failed: {}", e);
+                FsError::GeneralFailure
+            })?;
 
-            let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
-
-            for key in tree.keys() {
-                if let Ok(relative) = key.strip_prefix(&prefix) {
-                    if relative.as_os_str().is_empty() {
-                        continue;
-                    }
-                    let first = relative.components().next().unwrap();
-                    let name = first.as_os_str().to_string_lossy().to_string();
-                    if name == ".davgit_dir" {
-                        continue;
-                    }
-                    if entries.iter().any(|e| e.name() == name.as_bytes()) {
-                        continue;
-                    }
-
-                    let is_dir = relative.components().count() > 1;
-                    let child_path = prefix.join(&name);
-                    let len = if is_dir {
-                        0
-                    } else {
-                        tree.get(&child_path).map(|d| d.len() as u64).unwrap_or(0)
-                    };
-
-                    entries.push(Box::new(GitDavDirEntry {
-                        name: name.clone(),
-                        is_dir,
-                        len,
-                    }));
-                }
-            }
-
-            if entries.is_empty() && !p.as_os_str().is_empty() && !self.is_dir(&p) {
+            if entries.is_empty() && !p.as_os_str().is_empty() && !self.git.is_directory(&p) {
                 return Err(FsError::NotFound);
             }
 
-            let stream: FsStream<Box<dyn DavDirEntry>> =
-                Box::pin(stream::iter(entries.into_iter().map(Ok)));
+            let stream: FsStream<Box<dyn DavDirEntry>> = Box::pin(
+                stream::iter(entries.into_iter().map(|(name, is_dir, len)| {
+                    Ok(Box::new(GitDavDirEntry { name, is_dir, len }) as Box<dyn DavDirEntry>)
+                })),
+            );
             Ok(stream)
         })
     }
 
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            self.refresh_if_stale();
+            self.git.refresh_if_stale();
             let p = self.davpath_to_pathbuf(path);
 
-            if self.is_dir(&p) {
+            if self.git.is_directory(&p) {
                 Ok(Box::new(GitDavMeta {
                     len: 0,
                     is_dir: true,
                 }) as Box<dyn DavMetaData>)
-            } else if self.file_exists(&p) {
-                let len = self
-                    .tree
-                    .read()
-                    .unwrap()
-                    .get(&p)
-                    .map(|d| d.len() as u64)
-                    .unwrap_or(0);
+            } else if let Some(len) = self.git.file_size(&p) {
                 Ok(Box::new(GitDavMeta { len, is_dir: false }) as Box<dyn DavMetaData>)
             } else {
                 Err(FsError::NotFound)
@@ -199,10 +117,7 @@ impl DavFileSystem for GitDavFs {
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let p = self.davpath_to_pathbuf(path);
-            let mut tree = self.tree.write().unwrap();
-            let marker = p.join(".davgit_dir");
-            tree.entry(marker).or_default();
-            drop(tree);
+            self.git.create_dir(&p);
             Ok(())
         })
     }
@@ -210,11 +125,10 @@ impl DavFileSystem for GitDavFs {
     fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let p = self.davpath_to_pathbuf(path);
-            {
-                let mut tree = self.tree.write().unwrap();
-                tree.remove(&p);
-            }
-            self.commit_delete(&p)?;
+            self.git.delete_path(&p).map_err(|e| {
+                tracing::error!("git delete failed: {}", e);
+                FsError::GeneralFailure
+            })?;
             Ok(())
         })
     }
@@ -222,36 +136,13 @@ impl DavFileSystem for GitDavFs {
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let p = self.davpath_to_pathbuf(path);
-            let prefix = {
-                let mut pp = p.clone();
-                pp.push("");
-                pp
-            };
 
-            let keys_to_remove: Vec<PathBuf> = {
-                let tree = self.tree.read().unwrap();
-                tree.keys()
-                    .filter(|k| k.starts_with(&prefix) || **k == p)
-                    .cloned()
-                    .collect()
-            };
-
-            let deletes: Vec<PathBuf> = keys_to_remove
-                .iter()
-                .filter(|k| k.file_name().is_none_or(|n| n != ".davgit_dir"))
-                .cloned()
-                .collect();
-
+            let (writes, deletes) = self.dir_diff(&p);
             if !deletes.is_empty() {
-                self.git.batch_paths(&[], &deletes).map_err(|e| {
+                self.git.batch_paths(&writes, &deletes).map_err(|e| {
                     tracing::error!("git batch delete failed: {}", e);
                     FsError::GeneralFailure
                 })?;
-            }
-
-            let mut tree = self.tree.write().unwrap();
-            for key in keys_to_remove {
-                tree.remove(&key);
             }
             Ok(())
         })
@@ -262,61 +153,19 @@ impl DavFileSystem for GitDavFs {
             let src = self.davpath_to_pathbuf(from);
             let dst = self.davpath_to_pathbuf(to);
 
-            let data = {
-                let tree = self.tree.read().unwrap();
-                tree.get(&src).cloned()
-            };
-
-            if let Some(data) = data {
+            if let Some(data) = self.git.read_file(&src).ok().flatten() {
                 self.git
-                    .batch_paths(&[(dst.clone(), data.clone())], std::slice::from_ref(&src))
+                    .batch_paths(&[(dst.clone(), data)], &[src])
                     .map_err(|e| {
                         tracing::error!("git rename failed: {}", e);
                         FsError::GeneralFailure
                     })?;
-
-                let mut tree = self.tree.write().unwrap();
-                tree.insert(dst, data);
-                tree.remove(&src);
             } else {
-                let entries: Vec<(PathBuf, Vec<u8>)> = {
-                    let tree = self.tree.read().unwrap();
-                    let prefix = {
-                        let mut pp = src.clone();
-                        pp.push("");
-                        pp
-                    };
-                    tree.iter()
-                        .filter(|(k, _)| k.starts_with(&prefix))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                };
-
-                let writes: Vec<(PathBuf, Vec<u8>)> = entries
-                    .iter()
-                    .map(|(old_path, data)| {
-                        let rel = old_path.strip_prefix(&src).unwrap();
-                        (dst.join(rel), data.clone())
-                    })
-                    .collect();
-                let deletes: Vec<PathBuf> = entries
-                    .iter()
-                    .map(|(old_path, _)| old_path.clone())
-                    .collect();
-
+                let (writes, deletes) = self.copy_diff(&src, &dst);
                 self.git.batch_paths(&writes, &deletes).map_err(|e| {
                     tracing::error!("git batch rename failed: {}", e);
                     FsError::GeneralFailure
                 })?;
-                drop(writes);
-
-                let mut tree = self.tree.write().unwrap();
-                for (old_path, data) in entries {
-                    let rel = old_path.strip_prefix(&src).unwrap();
-                    let new_path = dst.join(rel);
-                    tree.insert(new_path, data);
-                    tree.remove(&old_path);
-                }
             }
             Ok(())
         })
@@ -327,59 +176,84 @@ impl DavFileSystem for GitDavFs {
             let src = self.davpath_to_pathbuf(from);
             let dst = self.davpath_to_pathbuf(to);
 
-            let data = {
-                let tree = self.tree.read().unwrap();
-                tree.get(&src).cloned()
-            };
-
-            if let Some(data) = data {
+            if let Some(data) = self.git.read_file(&src).ok().flatten() {
                 self.git
-                    .batch_paths(&[(dst.clone(), data.clone())], &[])
+                    .batch_paths(&[(dst.clone(), data)], &[])
                     .map_err(|e| {
                         tracing::error!("git copy failed: {}", e);
                         FsError::GeneralFailure
                     })?;
-
-                let mut tree = self.tree.write().unwrap();
-                tree.insert(dst, data);
             } else {
                 let entries: Vec<(PathBuf, Vec<u8>)> = {
-                    let tree = self.tree.read().unwrap();
-                    let prefix = {
-                        let mut pp = src.clone();
-                        pp.push("");
-                        pp
-                    };
-                    tree.iter()
-                        .filter(|(k, _)| k.starts_with(&prefix))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
+                    let list = self
+                        .git
+                        .list_dir(&src)
+                        .ok()
+                        .unwrap_or_default();
+                    let mut result = Vec::new();
+                    for (name, is_dir, _len) in list {
+                        if !is_dir {
+                            let src_path = src.join(&name);
+                            if let Some(data) = self.git.read_file(&src_path).ok().flatten() {
+                                result.push((dst.join(&name), data));
+                            }
+                        }
+                    }
+                    result
                 };
 
-                let writes: Vec<(PathBuf, Vec<u8>)> = entries
-                    .iter()
-                    .map(|(old_path, data)| {
-                        let rel = old_path.strip_prefix(&src).unwrap();
-                        (dst.join(rel), data.clone())
-                    })
-                    .collect();
-
-                self.git.batch_paths(&writes, &[]).map_err(|e| {
+                self.git.batch_paths(&entries, &[]).map_err(|e| {
                     tracing::error!("git batch copy failed: {}", e);
                     FsError::GeneralFailure
                 })?;
-
-                let mut tree = self.tree.write().unwrap();
-                for (old_path, data) in entries {
-                    let rel = old_path.strip_prefix(&src).unwrap();
-                    let new_path = dst.join(rel);
-                    tree.insert(new_path, data);
-                }
             }
             Ok(())
         })
     }
 }
+
+impl GitDavFs {
+    /// Collect all files under `dir` that should be deleted, plus any writes
+    /// needed (none, for removal). Returns (writes, deletes).
+    fn dir_diff(&self, dir: &Path) -> (Vec<(PathBuf, Vec<u8>)>, Vec<PathBuf>) {
+        let deletes: Vec<PathBuf> = self
+            .git
+            .list_dir(dir)
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, is_dir, _)| !*is_dir)
+            .map(|(name, _, _)| dir.join(name))
+            .collect();
+        (vec![], deletes)
+    }
+
+    /// Collect all files under `src` to be moved to `dst` as writes and the
+    /// respective source paths as deletes.
+    fn copy_diff(
+        &self,
+        src: &Path,
+        dst: &Path,
+    ) -> (Vec<(PathBuf, Vec<u8>)>, Vec<PathBuf>) {
+        let list = self.git.list_dir(src).ok().unwrap_or_default();
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        for (name, is_dir, _len) in list {
+            if !is_dir {
+                let src_path = src.join(&name);
+                if let Some(data) = self.git.read_file(&src_path).ok().flatten() {
+                    writes.push((dst.join(&name), data));
+                    deletes.push(src_path);
+                }
+            }
+        }
+        (writes, deletes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 struct GitDavMeta {
@@ -401,24 +275,26 @@ impl DavMetaData for GitDavMeta {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File handle
+// ---------------------------------------------------------------------------
+
 struct GitDavFile {
     data: Vec<u8>,
     pos: usize,
     path: PathBuf,
-    is_write: bool,
-    write_ctx: Option<WriteCtx>,
+    git: Arc<GitRepo>,
     meta: GitDavMeta,
 }
 
 impl GitDavFile {
-    fn new(data: Vec<u8>, path: PathBuf, is_write: bool, write_ctx: Option<WriteCtx>) -> Self {
+    fn new(data: Vec<u8>, path: PathBuf, git: Arc<GitRepo>) -> Self {
         let len = data.len() as u64;
         GitDavFile {
             data,
             pos: 0,
             path,
-            is_write,
-            write_ctx,
+            git,
             meta: GitDavMeta { len, is_dir: false },
         }
     }
@@ -429,7 +305,6 @@ impl std::fmt::Debug for GitDavFile {
         f.debug_struct("GitDavFile")
             .field("path", &self.path)
             .field("pos", &self.pos)
-            .field("is_write", &self.is_write)
             .finish()
     }
 }
@@ -498,19 +373,19 @@ impl DavFile for GitDavFile {
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
         Box::pin(async move {
-            if let Some((ref git, ref tree_lock)) = self.write_ctx {
-                let data = std::mem::take(&mut self.data);
-                git.write_path(&self.path, &data).map_err(|e| {
-                    tracing::error!("git write on flush failed: {}", e);
-                    FsError::GeneralFailure
-                })?;
-                let mut tree = tree_lock.write().unwrap();
-                tree.insert(self.path.clone(), data);
-            }
+            let data = std::mem::take(&mut self.data);
+            self.git.write_path(&self.path, &data).map_err(|e| {
+                tracing::error!("git write on flush failed: {}", e);
+                FsError::GeneralFailure
+            })?;
             Ok(())
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Directory entry
+// ---------------------------------------------------------------------------
 
 struct GitDavDirEntry {
     name: String,

@@ -1,6 +1,6 @@
 mod cli;
 mod fs;
-mod git_bridge;
+mod git;
 
 use std::net::SocketAddr;
 
@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::cli::Args;
 use crate::fs::GitDavFs;
-use crate::git_bridge::GitRepo;
+use crate::git::GitRepo;
 
 fn resolve_author(args: &Args) -> (String, String) {
     let name = args.author_name.clone().unwrap_or_else(|| {
@@ -55,17 +55,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("failed to initialize and fetch from remote")?;
 
-    let tree = if let Some(tree_id) = git_repo.resolve_head_tree()? {
-        info!("loading tree from remote...");
-        git_repo.read_tree_to_memory(tree_id)?
-    } else {
-        info!("empty repository - starting with empty directory");
-        std::collections::HashMap::new()
-    };
-
-    info!("loaded {} files from remote", tree.len());
-
-    let fs = GitDavFs::new(tree, git_repo);
+    let fs = GitDavFs::new(git_repo);
     let handler = DavHandler::builder()
         .filesystem(Box::new(fs))
         .build_handler();

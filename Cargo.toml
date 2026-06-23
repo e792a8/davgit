@@ -18,6 +18,8 @@ hyper-util = { version = "0.1", features = ["full"] }
 # gix object model crates
 gix-object = "0.62"
 gix-hash = { version = "0.25", features = ["sha1"] }
+gix-actor = "0.41"
+smallvec = "1"
 
 # git protocol support (pkt-line, packfile)
 sha1 = "0.10"
