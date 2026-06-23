@@ -159,14 +159,20 @@ impl GitRepo {
 
     /// Check if a path is a directory.
     pub fn is_directory(&self, path: &Path) -> bool {
+        if path.as_os_str().is_empty() {
+            return true; // root is always a directory
+        }
         let index = self.index.lock().unwrap();
         let dirs = self.dirs.lock().unwrap();
         if dirs.contains(path) {
             return true;
         }
-        let mut prefix = path.to_path_buf();
-        prefix.push("");
-        index.keys().any(|k| k.starts_with(&prefix))
+        // Check if any index key is a child of `path` (not `path` itself)
+        let has_child = index.keys().any(|k| k != path && k.starts_with(path));
+        if has_child {
+            return true;
+        }
+        false
     }
 
     /// Get the content length of a file.
@@ -180,6 +186,11 @@ impl GitRepo {
     /// Notify that a directory was created (MKCOL) — tracked in-memory.
     pub fn create_dir(&self, path: &Path) {
         self.dirs.lock().unwrap().insert(path.to_path_buf());
+    }
+
+    /// Remove a directory marker (empty dir) from in-memory tracking.
+    pub fn remove_dir_marker(&self, path: &Path) {
+        self.dirs.lock().unwrap().remove(path);
     }
 
     // -----------------------------------------------------------------------
@@ -398,5 +409,13 @@ fn build_change_commit(
     let commit_data = build_commit(&tree_oid, parent_oid.as_ref(), author_name, author_email, message);
     let commit_oid = hash_object(OBJ_COMMIT, &commit_data);
     objects.push((OBJ_COMMIT, commit_data));
-    Ok((commit_oid, objects))
+
+    // Deduplicate objects by OID (e.g. when same content exists at multiple paths)
+    let mut seen = std::collections::HashSet::new();
+    let deduped: ObjectList = objects
+        .into_iter()
+        .filter(|(kind, data)| seen.insert(hash_object(*kind, data)))
+        .collect();
+
+    Ok((commit_oid, deduped))
 }

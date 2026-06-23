@@ -1,12 +1,12 @@
 mod cli;
-mod fs;
+mod handler;
 mod git;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use dav_server::DavHandler;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -14,7 +14,6 @@ use hyper_util::rt::TokioIo;
 use tracing::info;
 
 use crate::cli::Args;
-use crate::fs::GitDavFs;
 use crate::git::GitRepo;
 
 fn resolve_author(args: &Args) -> (String, String) {
@@ -55,10 +54,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("failed to initialize and fetch from remote")?;
 
-    let fs = GitDavFs::new(git_repo);
-    let handler = DavHandler::builder()
-        .filesystem(Box::new(fs))
-        .build_handler();
+    let git = Arc::new(git_repo);
 
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port)
         .parse()
@@ -72,15 +68,15 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let handler = handler.clone();
+        let git = git.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             if let Err(err) = http1::Builder::new()
                 .serve_connection(
                     io,
                     service_fn(move |req: hyper::Request<Incoming>| {
-                        let h = handler.clone();
-                        async move { Ok::<_, hyper::Error>(h.handle(req).await) }
+                        let git = git.clone();
+                        async move { Ok::<_, hyper::Error>(handler::handle_request(req, git).await) }
                     }),
                 )
                 .await
