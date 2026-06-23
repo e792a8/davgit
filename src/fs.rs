@@ -63,13 +63,6 @@ impl GitDavFs {
         tree.contains_key(path)
     }
 
-    fn commit_write(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
-        self.git.write_path(path, data).map_err(|e| {
-            tracing::error!("git write failed: {}", e);
-            FsError::GeneralFailure
-        })
-    }
-
     fn commit_delete(&self, path: &Path) -> Result<(), FsError> {
         self.git.delete_path(path).map_err(|e| {
             tracing::error!("git delete failed: {}", e);
@@ -245,7 +238,7 @@ impl DavFileSystem for GitDavFs {
 
             let deletes: Vec<PathBuf> = keys_to_remove
                 .iter()
-                .filter(|k| !k.file_name().is_some_and(|n| n == ".davgit_dir"))
+                .filter(|k| k.file_name().is_none_or(|n| n != ".davgit_dir"))
                 .cloned()
                 .collect();
 
@@ -276,7 +269,7 @@ impl DavFileSystem for GitDavFs {
 
             if let Some(data) = data {
                 self.git
-                    .batch_paths(&[(dst.clone(), data.clone())], &[src.clone()])
+                    .batch_paths(&[(dst.clone(), data.clone())], std::slice::from_ref(&src))
                     .map_err(|e| {
                         tracing::error!("git rename failed: {}", e);
                         FsError::GeneralFailure
