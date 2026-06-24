@@ -1,7 +1,10 @@
 [package]
 name = "davgit"
+description = "Serves a remote Git repository as WebDAV server"
+authors = ["e792a8 <1571224208@qq.com>"]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
