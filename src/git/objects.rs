@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use gix_object::{tree, Tree, TreeRefIter, WriteTo};
+use gix_object::{Tree, TreeRefIter, WriteTo, tree};
 
-use crate::git::packfile::{hash_object, ObjectId, OBJ_BLOB, OBJ_TREE};
+use crate::git::packfile::{OBJ_BLOB, OBJ_TREE, ObjectId, hash_object};
 
 type ObjectList = Vec<(u8, Vec<u8>)>;
+type IndexContents = (HashMap<PathBuf, ObjectId>, HashMap<PathBuf, Vec<u8>>);
 
 // ---------------------------------------------------------------------------
 // Tree walking
@@ -16,7 +17,7 @@ type ObjectList = Vec<(u8, Vec<u8>)>;
 pub fn build_index_and_contents(
     objects: &HashMap<ObjectId, Vec<u8>>,
     tree_oid: &ObjectId,
-) -> Result<(HashMap<PathBuf, ObjectId>, HashMap<PathBuf, Vec<u8>>)> {
+) -> Result<IndexContents> {
     let mut index = HashMap::new();
     let mut contents = HashMap::new();
     walk_rec(objects, tree_oid, Path::new(""), &mut index, &mut contents)?;
@@ -53,15 +54,11 @@ fn walk_rec(
     Ok(())
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Tree building
 // ---------------------------------------------------------------------------
 
-fn build_tree_object(
-    entries: &BTreeMap<String, (u32, ObjectId)>,
-) -> Result<Vec<u8>> {
+fn build_tree_object(entries: &BTreeMap<String, (u32, ObjectId)>) -> Result<Vec<u8>> {
     let gix_tree = Tree {
         entries: entries
             .iter()
@@ -80,9 +77,7 @@ fn build_tree_object(
     Ok(buf)
 }
 
-pub fn build_trees(
-    files: &HashMap<PathBuf, Vec<u8>>,
-) -> Result<(ObjectId, ObjectList)> {
+pub fn build_trees(files: &HashMap<PathBuf, Vec<u8>>) -> Result<(ObjectId, ObjectList)> {
     let mut blob_oids: HashMap<PathBuf, ObjectId> = HashMap::new();
     let mut all_objects: Vec<(u8, Vec<u8>)> = Vec::new();
 
@@ -181,5 +176,3 @@ pub fn build_commit(
     commit.write_to(&mut buf).expect("commit serialization");
     buf
 }
-
-

@@ -1,6 +1,6 @@
 mod cli;
-mod handler;
 mod git;
+mod handler;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

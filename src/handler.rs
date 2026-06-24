@@ -38,11 +38,7 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
 // Handler functions
 // ---------------------------------------------------------------------------
 
-async fn handle_get(
-    path: &Path,
-    req: &Request<Incoming>,
-    git: &GitRepo,
-) -> Response<Full<Bytes>> {
+async fn handle_get(path: &Path, req: &Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
     if git.is_directory(path) {
         return not_found();
     }
@@ -51,10 +47,10 @@ async fn handle_get(
             let etag = compute_etag(&data);
             let ct = content_type(path);
 
-            if let Some(val) = req.headers().get("if-none-match") {
-                if val.to_str().ok() == Some(&etag) {
-                    return not_modified();
-                }
+            if let Some(val) = req.headers().get("if-none-match")
+                && val.to_str().ok() == Some(&etag)
+            {
+                return not_modified();
             }
 
             Response::builder()
@@ -74,11 +70,7 @@ async fn handle_get(
     }
 }
 
-async fn handle_head(
-    path: &Path,
-    req: &Request<Incoming>,
-    git: &GitRepo,
-) -> Response<Full<Bytes>> {
+async fn handle_head(path: &Path, req: &Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
     let resp = handle_get(path, req, git).await;
     Response::builder()
         .status(resp.status())
@@ -86,11 +78,7 @@ async fn handle_head(
         .unwrap()
 }
 
-async fn handle_put(
-    path: &Path,
-    req: Request<Incoming>,
-    git: &GitRepo,
-) -> Response<Full<Bytes>> {
+async fn handle_put(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
     // PUT to a non-existent parent must fail with 409
     let parent = path.parent().unwrap_or(Path::new(""));
     if !parent.as_os_str().is_empty() && !git.is_directory(parent) {
@@ -107,7 +95,11 @@ async fn handle_put(
 
     match git.write_path(path, &data).await {
         Ok(_) => {
-            if data.is_empty() { no_content() } else { created() }
+            if data.is_empty() {
+                no_content()
+            } else {
+                created()
+            }
         }
         Err(e) => {
             tracing::error!("write_path({:?}) failed: {}", path, e);
@@ -202,22 +194,27 @@ async fn handle_propfind(
 
     let mut resources = Vec::new();
     let is_dir = git.is_directory(path);
-    let len = if is_dir { 0 } else { git.file_size(path).unwrap_or(0) };
+    let len = if is_dir {
+        0
+    } else {
+        git.file_size(path).unwrap_or(0)
+    };
     resources.push(PropfindResource {
         path: path.to_path_buf(),
         is_dir,
         len,
     });
 
-    if depth >= 1 && is_dir {
-        if let Ok(entries) = git.list_dir(path) {
-            for (name, entry_is_dir, entry_len) in entries {
-                resources.push(PropfindResource {
-                    path: path.join(&name),
-                    is_dir: entry_is_dir,
-                    len: entry_len,
-                });
-            }
+    if depth >= 1
+        && is_dir
+        && let Ok(entries) = git.list_dir(path)
+    {
+        for (name, entry_is_dir, entry_len) in entries {
+            resources.push(PropfindResource {
+                path: path.join(&name),
+                is_dir: entry_is_dir,
+                len: entry_len,
+            });
         }
     }
 
@@ -269,7 +266,10 @@ async fn handle_copy_move(
             .filter(|(_, is_dir, _)| !*is_dir)
             .filter_map(|(name, _, _)| {
                 let src = path.join(name);
-                git.read_file(&src).ok().flatten().map(|data| (dest_path.join(name), data))
+                git.read_file(&src)
+                    .ok()
+                    .flatten()
+                    .map(|data| (dest_path.join(name), data))
             })
             .collect();
         if is_move {
@@ -288,16 +288,20 @@ async fn handle_copy_move(
             _ => return internal_error(),
         };
         let writes = vec![(dest_path.clone(), data)];
-        let deletes = if is_move { vec![path.to_path_buf()] } else { vec![] };
+        let deletes = if is_move {
+            vec![path.to_path_buf()]
+        } else {
+            vec![]
+        };
         (writes, deletes)
     };
 
-    if git.is_directory(&dest_path) {
-        if let Ok(entries) = git.list_dir(&dest_path) {
-            for (name, is_dir, _) in &entries {
-                if !is_dir {
-                    deletes.push(dest_path.join(name));
-                }
+    if git.is_directory(&dest_path)
+        && let Ok(entries) = git.list_dir(&dest_path)
+    {
+        for (name, is_dir, _) in &entries {
+            if !is_dir {
+                deletes.push(dest_path.join(name));
             }
         }
     }
@@ -342,7 +346,10 @@ fn build_multistatus(resources: &[PropfindResource]) -> String {
             xml.push_str("<D:getcontenttype>httpd/unix-directory</D:getcontenttype>");
             xml.push_str("<D:resourcetype><D:collection/></D:resourcetype>");
         } else {
-            xml.push_str(&format!("<D:getcontentlength>{}</D:getcontentlength>", r.len));
+            xml.push_str(&format!(
+                "<D:getcontentlength>{}</D:getcontentlength>",
+                r.len
+            ));
             xml.push_str(&format!(
                 "<D:getcontenttype>{}</D:getcontenttype>",
                 content_type(&r.path)
@@ -365,47 +372,80 @@ fn build_multistatus(resources: &[PropfindResource]) -> String {
 // ---------------------------------------------------------------------------
 
 fn created() -> Response<Full<Bytes>> {
-    Response::builder().status(201).body(Full::default()).unwrap()
+    Response::builder()
+        .status(201)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn no_content() -> Response<Full<Bytes>> {
-    Response::builder().status(204).body(Full::default()).unwrap()
+    Response::builder()
+        .status(204)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn not_modified() -> Response<Full<Bytes>> {
-    Response::builder().status(304).body(Full::default()).unwrap()
+    Response::builder()
+        .status(304)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn not_found() -> Response<Full<Bytes>> {
-    Response::builder().status(404).body(Full::default()).unwrap()
+    Response::builder()
+        .status(404)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn conflict() -> Response<Full<Bytes>> {
-    Response::builder().status(409).body(Full::default()).unwrap()
+    Response::builder()
+        .status(409)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn method_not_allowed() -> Response<Full<Bytes>> {
-    Response::builder().status(405).body(Full::default()).unwrap()
+    Response::builder()
+        .status(405)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn not_implemented() -> Response<Full<Bytes>> {
-    Response::builder().status(501).body(Full::default()).unwrap()
+    Response::builder()
+        .status(501)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn bad_request() -> Response<Full<Bytes>> {
-    Response::builder().status(400).body(Full::default()).unwrap()
+    Response::builder()
+        .status(400)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn precondition_failed() -> Response<Full<Bytes>> {
-    Response::builder().status(412).body(Full::default()).unwrap()
+    Response::builder()
+        .status(412)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn unsupported_media_type() -> Response<Full<Bytes>> {
-    Response::builder().status(415).body(Full::default()).unwrap()
+    Response::builder()
+        .status(415)
+        .body(Full::default())
+        .unwrap()
 }
 
 fn internal_error() -> Response<Full<Bytes>> {
-    Response::builder().status(500).body(Full::default()).unwrap()
+    Response::builder()
+        .status(500)
+        .body(Full::default())
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -414,11 +454,19 @@ fn internal_error() -> Response<Full<Bytes>> {
 
 fn davpath_to_rel(s: &str) -> PathBuf {
     let s = s.strip_prefix('/').unwrap_or(s);
-    if s.is_empty() { PathBuf::new() } else { PathBuf::from(s) }
+    if s.is_empty() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(s)
+    }
 }
 
 fn href_encode(path: &Path) -> String {
-    if path.as_os_str().is_empty() { "/".into() } else { format!("/{}", path.display()) }
+    if path.as_os_str().is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", path.display())
+    }
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -473,10 +521,10 @@ fn parse_destination(req: &Request<Incoming>) -> Option<PathBuf> {
 }
 
 fn parse_overwrite(headers: &hyper::HeaderMap) -> bool {
-    match headers.get("overwrite").and_then(|v| v.to_str().ok()) {
-        Some("F") => false,
-        _ => true,
-    }
+    !matches!(
+        headers.get("overwrite").and_then(|v| v.to_str().ok()),
+        Some("F")
+    )
 }
 
 async fn read_body(body: Incoming) -> Result<Vec<u8>, hyper::Error> {

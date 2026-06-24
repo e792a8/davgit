@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::git::objects::{build_commit, build_index_and_contents, build_trees};
-use crate::git::packfile::{build_packfile, hash_object, parse_packfile, ObjectId, OBJ_COMMIT};
+use crate::git::packfile::{OBJ_COMMIT, ObjectId, build_packfile, hash_object, parse_packfile};
 use crate::git::transport::do_fetch;
 use crate::git::transport::do_push;
 
@@ -202,11 +202,10 @@ impl GitRepo {
         let msg = format!("update {}", path_str);
 
         for _ in 0..MAX_RETRIES {
-            if self.commit_and_push(
-                &[(path.to_path_buf(), data.to_vec())],
-                &[],
-                &msg,
-            ).await? {
+            if self
+                .commit_and_push(&[(path.to_path_buf(), data.to_vec())], &[], &msg)
+                .await?
+            {
                 return Ok(());
             }
         }
@@ -218,7 +217,10 @@ impl GitRepo {
         let msg = format!("delete {}", path_str);
 
         for _ in 0..MAX_RETRIES {
-            if self.commit_and_push(&[], &[path.to_path_buf()], &msg).await? {
+            if self
+                .commit_and_push(&[], &[path.to_path_buf()], &msg)
+                .await?
+            {
                 return Ok(());
             }
         }
@@ -231,7 +233,10 @@ impl GitRepo {
         deletes: &[PathBuf],
     ) -> Result<()> {
         for _ in 0..MAX_RETRIES {
-            if self.commit_and_push(writes, deletes, "batch update").await? {
+            if self
+                .commit_and_push(writes, deletes, "batch update")
+                .await?
+            {
                 return Ok(());
             }
         }
@@ -280,7 +285,8 @@ impl GitRepo {
                     return false;
                 }
             };
-            let commit = match gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1) {
+            let commit = match gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)
+            {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("commit parse failed: {}", e);
@@ -359,7 +365,10 @@ impl GitRepo {
             message,
         )?;
 
-        let entries: Vec<(u8, &[u8])> = object_list.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+        let entries: Vec<(u8, &[u8])> = object_list
+            .iter()
+            .map(|(k, v)| (*k, v.as_slice()))
+            .collect();
         let packfile = build_packfile(&entries)?;
 
         let pushed = do_push(
@@ -410,7 +419,13 @@ fn build_change_commit(
     message: &str,
 ) -> Result<(ObjectId, ObjectList)> {
     let (tree_oid, mut objects) = build_trees(files)?;
-    let commit_data = build_commit(&tree_oid, parent_oid.as_ref(), author_name, author_email, message);
+    let commit_data = build_commit(
+        &tree_oid,
+        parent_oid.as_ref(),
+        author_name,
+        author_email,
+        message,
+    );
     let commit_oid = hash_object(OBJ_COMMIT, &commit_data);
     objects.push((OBJ_COMMIT, commit_data));
 

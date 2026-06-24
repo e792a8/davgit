@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use russh::client;
 use russh::keys::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -40,7 +40,9 @@ pub fn parse_ssh_url(url: &str) -> Result<SshTarget> {
         let path = format!("/{}", path);
 
         let (userinfo, host_with_port) = user_host.split_once('@').unwrap_or(("", user_host));
-        let (host, port_str) = host_with_port.split_once(':').unwrap_or((host_with_port, ""));
+        let (host, port_str) = host_with_port
+            .split_once(':')
+            .unwrap_or((host_with_port, ""));
         let port = if port_str.is_empty() {
             None
         } else {
@@ -52,7 +54,12 @@ pub fn parse_ssh_url(url: &str) -> Result<SshTarget> {
             Some(userinfo.to_owned())
         };
 
-        Ok(SshTarget { user, host: host.to_owned(), port, path })
+        Ok(SshTarget {
+            user,
+            host: host.to_owned(),
+            port,
+            path,
+        })
     } else if let Some(at_pos) = url.rfind('@') {
         let user = if at_pos > 0 {
             Some(url[..at_pos].to_owned())
@@ -63,16 +70,34 @@ pub fn parse_ssh_url(url: &str) -> Result<SshTarget> {
         if let Some(colon_pos) = rest.find(':') {
             let host = rest[..colon_pos].to_owned();
             let path = rest[colon_pos + 1..].to_owned();
-            let path = if path.starts_with('/') { path } else { format!("/{}", path) };
-            Ok(SshTarget { user, host, port: None, path })
+            let path = if path.starts_with('/') {
+                path
+            } else {
+                format!("/{}", path)
+            };
+            Ok(SshTarget {
+                user,
+                host,
+                port: None,
+                path,
+            })
         } else {
             bail!("invalid SCP-style URL: no colon after host in '{}'", url)
         }
     } else if let Some(colon_pos) = url.find(':') {
         let host = url[..colon_pos].to_owned();
         let path = url[colon_pos + 1..].to_owned();
-        let path = if path.starts_with('/') { path } else { format!("/{}", path) };
-        Ok(SshTarget { user: None, host, port: None, path })
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            format!("/{}", path)
+        };
+        Ok(SshTarget {
+            user: None,
+            host,
+            port: None,
+            path,
+        })
     } else {
         bail!("URL must start with ssh:// or be in SCP-style [user@]host:path");
     }
@@ -128,17 +153,16 @@ async fn connect_ssh(
         if !try_agent_auth(&mut session, &user).await
             && !try_default_keys(&mut session, &user).await
         {
-            bail!("authentication failed (no key provided, ssh-agent unavailable, and no default key worked)");
+            bail!(
+                "authentication failed (no key provided, ssh-agent unavailable, and no default key worked)"
+            );
         }
     }
 
     Ok(session)
 }
 
-async fn try_agent_auth(
-    session: &mut client::Handle<SshHandler>,
-    user: &str,
-) -> bool {
+async fn try_agent_auth(session: &mut client::Handle<SshHandler>, user: &str) -> bool {
     let mut agent = match agent::client::AgentClient::connect_env().await {
         Ok(a) => a,
         Err(e) => {
@@ -167,10 +191,7 @@ async fn try_agent_auth(
     false
 }
 
-async fn try_default_keys(
-    session: &mut client::Handle<SshHandler>,
-    user: &str,
-) -> bool {
+async fn try_default_keys(session: &mut client::Handle<SshHandler>, user: &str) -> bool {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return false,
@@ -383,13 +404,14 @@ async fn try_fetch(
     let mut offset = 0;
     while offset + 8 <= raw.len() {
         let len_str = std::str::from_utf8(&raw[offset..offset + 4]).unwrap_or("xxxx");
-        if let Ok(len) = usize::from_str_radix(len_str, 16) {
-            if len >= 4 && offset + len <= raw.len() {
-                let content = &raw[offset + 4..offset + len];
-                if content.starts_with(b"NAK") || content.starts_with(b"ACK") {
-                    offset += len;
-                    continue;
-                }
+        if let Ok(len) = usize::from_str_radix(len_str, 16)
+            && len >= 4
+            && offset + len <= raw.len()
+        {
+            let content = &raw[offset + 4..offset + len];
+            if content.starts_with(b"NAK") || content.starts_with(b"ACK") {
+                offset += len;
+                continue;
             }
         }
         break;
@@ -415,7 +437,16 @@ pub async fn do_push(
     packfile: &[u8],
 ) -> Result<bool> {
     for attempt in 1..=MAX_RETRIES {
-        match try_push(remote_url, branch, ssh_key, password, new_commit_oid, packfile).await {
+        match try_push(
+            remote_url,
+            branch,
+            ssh_key,
+            password,
+            new_commit_oid,
+            packfile,
+        )
+        .await
+        {
             Ok(true) => return Ok(true),
             Ok(false) => {
                 tracing::warn!("push attempt {} returned non-fast-forward", attempt);

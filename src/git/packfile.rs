@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use anyhow::{bail, Result};
-use flate2::write::ZlibEncoder;
+use anyhow::{Result, bail};
 use flate2::Compression;
 use flate2::Decompress;
 use flate2::FlushDecompress;
 use flate2::Status;
+use flate2::write::ZlibEncoder;
 use sha1::{Digest, Sha1};
 
 pub use gix_hash::ObjectId;
@@ -117,13 +117,34 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             let mut copy_offset = 0u32;
             let mut copy_size: u32 = 0;
 
-            if cmd & 0x01 != 0 { copy_offset |= delta[pos] as u32; pos += 1; }
-            if cmd & 0x02 != 0 { copy_offset |= (delta[pos] as u32) << 8; pos += 1; }
-            if cmd & 0x04 != 0 { copy_offset |= (delta[pos] as u32) << 16; pos += 1; }
-            if cmd & 0x08 != 0 { copy_offset |= (delta[pos] as u32) << 24; pos += 1; }
-            if cmd & 0x10 != 0 { copy_size |= delta[pos] as u32; pos += 1; }
-            if cmd & 0x20 != 0 { copy_size |= (delta[pos] as u32) << 8; pos += 1; }
-            if cmd & 0x40 != 0 { copy_size |= (delta[pos] as u32) << 16; pos += 1; }
+            if cmd & 0x01 != 0 {
+                copy_offset |= delta[pos] as u32;
+                pos += 1;
+            }
+            if cmd & 0x02 != 0 {
+                copy_offset |= (delta[pos] as u32) << 8;
+                pos += 1;
+            }
+            if cmd & 0x04 != 0 {
+                copy_offset |= (delta[pos] as u32) << 16;
+                pos += 1;
+            }
+            if cmd & 0x08 != 0 {
+                copy_offset |= (delta[pos] as u32) << 24;
+                pos += 1;
+            }
+            if cmd & 0x10 != 0 {
+                copy_size |= delta[pos] as u32;
+                pos += 1;
+            }
+            if cmd & 0x20 != 0 {
+                copy_size |= (delta[pos] as u32) << 8;
+                pos += 1;
+            }
+            if cmd & 0x40 != 0 {
+                copy_size |= (delta[pos] as u32) << 16;
+                pos += 1;
+            }
 
             if copy_size == 0 {
                 copy_size = 0x10000;
@@ -215,7 +236,9 @@ pub fn parse_packfile(data: &[u8]) -> Result<HashMap<ObjectId, Vec<u8>>> {
             if consumed == 0 {
                 bail!(
                     "zlib decompression stalled at byte {} (object {}, data_len={})",
-                    pos, i, data.len()
+                    pos,
+                    i,
+                    data.len()
                 );
             }
         }
@@ -230,10 +253,9 @@ pub fn parse_packfile(data: &[u8]) -> Result<HashMap<ObjectId, Vec<u8>>> {
             }
             OBJ_OFS_DELTA => {
                 let base_pos = delta_base_pos.unwrap();
-                let base_oid = by_offset
-                    .get(&base_pos)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("OFS_DELTA base not found at offset 0x{:x}", base_pos))?;
+                let base_oid = by_offset.get(&base_pos).copied().ok_or_else(|| {
+                    anyhow::anyhow!("OFS_DELTA base not found at offset 0x{:x}", base_pos)
+                })?;
                 let base_type = obj_types[&base_oid];
                 let resolved = apply_delta(&objects[&base_oid], &content)?;
                 let oid = hash_object(base_type, &resolved);
