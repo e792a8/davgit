@@ -34,7 +34,7 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
-    pub fn init_and_fetch(
+    pub async fn init_and_fetch(
         remote_url: &str,
         branch: &str,
         ssh_key: Option<&str>,
@@ -67,20 +67,20 @@ impl GitRepo {
             last_fetch: Mutex::new(Instant::now()),
         };
 
-        repo.try_fetch_and_cache(None);
+        repo.try_fetch_and_cache(None).await;
         Ok(repo)
     }
 
     /// Try to fetch fresh data and update the internal cache.
     /// Returns true if the cache was updated.
-    pub fn refresh_if_stale(&self) -> bool {
+    pub async fn refresh_if_stale(&self) -> bool {
         {
             let last = self.last_fetch.lock().unwrap();
             if last.elapsed() < FETCH_THROTTLE {
                 return false;
             }
         }
-        self.try_fetch_and_cache(Some(true))
+        self.try_fetch_and_cache(Some(true)).await
     }
 
     /// Read a file's content. Returns `None` if the path is a directory or doesn't exist.
@@ -197,7 +197,7 @@ impl GitRepo {
     // Write operations (commit + push)
     // -----------------------------------------------------------------------
 
-    pub fn write_path(&self, path: &Path, data: &[u8]) -> Result<()> {
+    pub async fn write_path(&self, path: &Path, data: &[u8]) -> Result<()> {
         let path_str = path.to_str().context("invalid path")?.to_owned();
         let msg = format!("update {}", path_str);
 
@@ -206,32 +206,32 @@ impl GitRepo {
                 &[(path.to_path_buf(), data.to_vec())],
                 &[],
                 &msg,
-            )? {
+            ).await? {
                 return Ok(());
             }
         }
         bail!("write failed after {} attempts", MAX_RETRIES);
     }
 
-    pub fn delete_path(&self, path: &Path) -> Result<()> {
+    pub async fn delete_path(&self, path: &Path) -> Result<()> {
         let path_str = path.to_str().context("invalid path")?.to_owned();
         let msg = format!("delete {}", path_str);
 
         for _ in 0..MAX_RETRIES {
-            if self.commit_and_push(&[], &[path.to_path_buf()], &msg)? {
+            if self.commit_and_push(&[], &[path.to_path_buf()], &msg).await? {
                 return Ok(());
             }
         }
         bail!("delete failed after {} attempts", MAX_RETRIES);
     }
 
-    pub fn batch_paths(
+    pub async fn batch_paths(
         &self,
         writes: &[(PathBuf, Vec<u8>)],
         deletes: &[PathBuf],
     ) -> Result<()> {
         for _ in 0..MAX_RETRIES {
-            if self.commit_and_push(writes, deletes, "batch update")? {
+            if self.commit_and_push(writes, deletes, "batch update").await? {
                 return Ok(());
             }
         }
@@ -242,13 +242,15 @@ impl GitRepo {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn try_fetch_and_cache(&self, _is_refresh: Option<bool>) -> bool {
+    async fn try_fetch_and_cache(&self, _is_refresh: Option<bool>) -> bool {
         let result = match do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("fetch failed: {}", e);
@@ -305,13 +307,14 @@ impl GitRepo {
         true
     }
 
-    fn fetch_for_write(&self) -> Result<(HashMap<PathBuf, Vec<u8>>, ObjectId)> {
+    async fn fetch_for_write(&self) -> Result<(HashMap<PathBuf, Vec<u8>>, ObjectId)> {
         let result = do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
-        )?;
+        )
+        .await?;
         let head = result.head_commit_oid;
         let objects = parse_packfile(&result.packfile)?;
 
@@ -333,13 +336,13 @@ impl GitRepo {
         Ok((files, head))
     }
 
-    fn commit_and_push(
+    async fn commit_and_push(
         &self,
         writes: &[(PathBuf, Vec<u8>)],
         deletes: &[PathBuf],
         message: &str,
     ) -> Result<bool> {
-        let (mut files, parent_oid) = self.fetch_for_write()?;
+        let (mut files, parent_oid) = self.fetch_for_write().await?;
 
         for (path, data) in writes {
             files.insert(path.clone(), data.clone());
@@ -366,7 +369,8 @@ impl GitRepo {
             self.password.as_deref(),
             commit_oid,
             &packfile,
-        )?;
+        )
+        .await?;
 
         if pushed {
             // Cache the new commit and objects

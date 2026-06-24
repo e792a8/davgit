@@ -13,7 +13,7 @@ use crate::git::GitRepo;
 // ---------------------------------------------------------------------------
 
 pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Response<Full<Bytes>> {
-    git.refresh_if_stale();
+    git.refresh_if_stale().await;
 
     let rel_path = davpath_to_rel(req.uri().path());
 
@@ -105,7 +105,7 @@ async fn handle_put(
         }
     };
 
-    match git.write_path(path, &data) {
+    match git.write_path(path, &data).await {
         Ok(_) => {
             if data.is_empty() { no_content() } else { created() }
         }
@@ -128,7 +128,7 @@ async fn handle_delete(path: &Path, git: &GitRepo) -> Response<Full<Bytes>> {
             .map(|(name, _, _)| path.join(name))
             .collect();
         if !deletes.is_empty() {
-            match git.batch_paths(&[], &deletes) {
+            match git.batch_paths(&[], &deletes).await {
                 Ok(_) => {
                     git.remove_dir_marker(path);
                     no_content()
@@ -143,7 +143,7 @@ async fn handle_delete(path: &Path, git: &GitRepo) -> Response<Full<Bytes>> {
             no_content()
         }
     } else if git.file_size(path).is_some() {
-        match git.delete_path(path) {
+        match git.delete_path(path).await {
             Ok(_) => no_content(),
             Err(e) => {
                 tracing::error!("delete_path({:?}) failed: {}", path, e);
@@ -259,7 +259,7 @@ async fn handle_copy_move(
         return precondition_failed();
     }
 
-    let (mut writes, mut deletes) = if git.is_directory(path) {
+    let (writes, mut deletes) = if git.is_directory(path) {
         let entries = match git.list_dir(path) {
             Ok(entries) => entries,
             Err(_) => return internal_error(),
@@ -302,7 +302,7 @@ async fn handle_copy_move(
         }
     }
 
-    match git.batch_paths(&writes, &deletes) {
+    match git.batch_paths(&writes, &deletes).await {
         Ok(_) => {
             if is_move && git.is_directory(path) {
                 git.remove_dir_marker(path);

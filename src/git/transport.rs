@@ -1,8 +1,11 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use russh::client;
+use russh::keys::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::git::packfile::ObjectId;
 
@@ -22,8 +25,13 @@ pub struct RefAdvertisement {
     pub capabilities: String,
 }
 
+pub struct FetchResult {
+    pub head_commit_oid: ObjectId,
+    pub packfile: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
-// URL parsing
+// URL parsing (unchanged)
 // ---------------------------------------------------------------------------
 
 pub fn parse_ssh_url(url: &str) -> Result<SshTarget> {
@@ -71,87 +79,179 @@ pub fn parse_ssh_url(url: &str) -> Result<SshTarget> {
 }
 
 // ---------------------------------------------------------------------------
-// SSH process management
+// SSH client handler
 // ---------------------------------------------------------------------------
 
-pub fn build_ssh_cmd(
+struct SshHandler;
+
+impl client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection helpers
+// ---------------------------------------------------------------------------
+
+async fn connect_ssh(
     target: &SshTarget,
-    service: &str,
     ssh_key: Option<&str>,
     _password: Option<&str>,
-) -> Command {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+) -> Result<client::Handle<SshHandler>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
 
-    if let Some(port) = target.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    if let Some(key) = ssh_key {
-        cmd.arg("-i").arg(key);
+    let addr = (target.host.as_str(), target.port.unwrap_or(22));
+    let mut session = client::connect(config, addr, SshHandler).await?;
+
+    let user = target.user.clone().unwrap_or_else(|| "git".to_string());
+
+    if let Some(key_path) = ssh_key {
+        let key_pair = load_secret_key(key_path, None)?;
+        let hash = session.best_supported_rsa_hash().await?.flatten();
+        let auth_res = session
+            .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash))
+            .await?;
+        if !auth_res.success() {
+            bail!("public key authentication failed");
+        }
+    } else {
+        // Try SSH agent first, then default key files
+        if !try_agent_auth(&mut session, &user).await
+            && !try_default_keys(&mut session, &user).await
+        {
+            bail!("authentication failed (no key provided, ssh-agent unavailable, and no default key worked)");
+        }
     }
 
-    let destination = match &target.user {
-        Some(u) => format!("{}@{}", u, target.host),
-        None => target.host.clone(),
+    Ok(session)
+}
+
+async fn try_agent_auth(
+    session: &mut client::Handle<SshHandler>,
+    user: &str,
+) -> bool {
+    let mut agent = match agent::client::AgentClient::connect_env().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!("agent connect_env failed: {}", e);
+            return false;
+        }
     };
-    cmd.arg(destination);
-    cmd.arg(format!("{} '{}'", service, target.path));
-    cmd
+    let identities = match agent.request_identities().await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::debug!("agent list identities failed: {}", e);
+            return false;
+        }
+    };
+    for identity in &identities {
+        let pubkey = identity.public_key().into_owned();
+        match session
+            .authenticate_publickey_with(user.to_owned(), pubkey, None, &mut agent)
+            .await
+        {
+            Ok(r) if r.success() => return true,
+            Ok(_) => {}
+            Err(e) => tracing::debug!("agent key auth failed: {e}"),
+        }
+    }
+    false
 }
 
-pub fn spawn_ssh(
-    remote_url: &str,
-    ssh_key: Option<&str>,
-    password: Option<&str>,
-    service: &str,
-) -> Result<(Child, BufReader<std::process::ChildStdout>)> {
-    let target = parse_ssh_url(remote_url)?;
-    let mut child = build_ssh_cmd(&target, service, ssh_key, password)
-        .spawn()
-        .context("failed to spawn ssh")?;
-
-    let stdout = BufReader::new(child.stdout.take().context("no stdout from ssh")?);
-    Ok((child, stdout))
+async fn try_default_keys(
+    session: &mut client::Handle<SshHandler>,
+    user: &str,
+) -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let default_paths = [
+        "id_ed25519",
+        "id_rsa",
+        "id_ecdsa",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+        "id_dsa",
+    ];
+    for filename in &default_paths {
+        let path = std::path::Path::new(&home).join(".ssh").join(filename);
+        if !path.exists() {
+            continue;
+        }
+        match load_secret_key(&path, None) {
+            Ok(key_pair) => {
+                let hash = match session.best_supported_rsa_hash().await {
+                    Ok(h) => h.flatten(),
+                    Err(_) => None,
+                };
+                match session
+                    .authenticate_publickey(
+                        user.to_owned(),
+                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash),
+                    )
+                    .await
+                {
+                    Ok(r) if r.success() => {
+                        tracing::debug!("authenticated with default key {:?}", path);
+                        return true;
+                    }
+                    _ => continue,
+                }
+            }
+            Err(e) => {
+                tracing::debug!("failed to load key {:?}: {}", path, e);
+                continue;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
-// pkt-line helpers
+// pkt-line async helpers
 // ---------------------------------------------------------------------------
 
-pub fn read_pkt_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+async fn read_pkt_line(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
+    if let Err(e) = reader.read_exact(&mut len_buf).await {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(e.into());
+    }
     let len_str = std::str::from_utf8(&len_buf)?;
     let len = usize::from_str_radix(len_str, 16).context("invalid pkt-line length")?;
-    if len == 0 {
-        return Ok(None);
-    }
-    if len == 1 {
+    if len <= 1 {
         return Ok(None);
     }
     let mut data = vec![0u8; len - 4];
-    reader.read_exact(&mut data)?;
+    reader.read_exact(&mut data).await?;
     Ok(Some(data))
 }
 
-pub fn write_pkt_line(writer: &mut impl Write, data: &[u8]) -> Result<()> {
+async fn write_pkt_line(writer: &mut (impl AsyncWriteExt + Unpin), data: &[u8]) -> Result<()> {
     let len = data.len() + 4;
     if len > 0xffff {
         bail!("pkt-line too long: {} bytes", len);
     }
-    write!(writer, "{:04x}", len)?;
-    writer.write_all(data)?;
+    let header = format!("{:04x}", len);
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(data).await?;
     Ok(())
 }
 
-pub fn write_flush(writer: &mut impl Write) -> Result<()> {
-    writer.write_all(b"0000")?;
+async fn write_flush(writer: &mut (impl AsyncWriteExt + Unpin)) -> Result<()> {
+    writer.write_all(b"0000").await?;
     Ok(())
 }
 
@@ -159,12 +259,12 @@ pub fn write_flush(writer: &mut impl Write) -> Result<()> {
 // Ref advertisement reader
 // ---------------------------------------------------------------------------
 
-pub fn read_refs(reader: &mut impl BufRead) -> Result<RefAdvertisement> {
+async fn read_refs(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<RefAdvertisement> {
     let mut refs = HashMap::new();
     let mut capabilities = String::new();
 
     loop {
-        let line = read_pkt_line(reader)?;
+        let line = read_pkt_line(reader).await?;
         match line {
             None => break,
             Some(data) => {
@@ -198,21 +298,16 @@ pub fn read_refs(reader: &mut impl BufRead) -> Result<RefAdvertisement> {
 // Fetch protocol
 // ---------------------------------------------------------------------------
 
-pub struct FetchResult {
-    pub head_commit_oid: ObjectId,
-    pub packfile: Vec<u8>,
-}
-
 const MAX_RETRIES: u32 = 3;
 
-pub fn do_fetch(
+pub async fn do_fetch(
     remote_url: &str,
     branch: &str,
     ssh_key: Option<&str>,
     password: Option<&str>,
 ) -> Result<FetchResult> {
     for attempt in 1..=MAX_RETRIES {
-        match try_fetch(remote_url, branch, ssh_key, password) {
+        match try_fetch(remote_url, branch, ssh_key, password).await {
             Ok(result) => return Ok(result),
             Err(e) if attempt < MAX_RETRIES => {
                 tracing::warn!("fetch attempt {} failed (will retry): {}", attempt, e);
@@ -226,17 +321,25 @@ pub fn do_fetch(
     unreachable!()
 }
 
-fn try_fetch(
+async fn try_fetch(
     remote_url: &str,
     branch: &str,
     ssh_key: Option<&str>,
     password: Option<&str>,
 ) -> Result<FetchResult> {
-    let (mut child, mut stdout) =
-        spawn_ssh(remote_url, ssh_key, password, "git-upload-pack")?;
-    let mut stdin = child.stdin.take().context("no stdin from ssh")?;
+    let target = parse_ssh_url(remote_url)?;
+    let session = connect_ssh(&target, ssh_key, password).await?;
 
-    let adv = read_refs(&mut stdout)?;
+    let channel = session.channel_open_session().await?;
+    channel
+        .exec(true, format!("git-upload-pack '{}'", target.path))
+        .await?;
+    let stream = channel.into_stream();
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut writer = write_half;
+
+    let adv = read_refs(&mut reader).await?;
 
     let head_ref = format!("refs/heads/{}", branch);
     let head_oid = adv
@@ -246,58 +349,64 @@ fn try_fetch(
         .with_context(|| format!("branch '{}' not found on remote", branch))?;
 
     let supported_caps = [
-        "multi_ack", "multi_ack_detailed", "no-progress", "ofs-delta",
+        "multi_ack",
+        "multi_ack_detailed",
+        "no-progress",
+        "ofs-delta",
     ];
-    tracing::debug!(
-        "server capabilities: {:?}, our caps: {:?}",
-        adv.capabilities,
-        supported_caps
-    );
-    let want_caps = adv.capabilities
+
+    let caps_str = adv
+        .capabilities
         .split_ascii_whitespace()
         .filter(|c| supported_caps.contains(c))
         .collect::<Vec<_>>()
         .join(" ");
-    let want_line = if want_caps.is_empty() {
-        tracing::warn!("no supported capabilities from server, sending bare want");
+
+    let want_line = if caps_str.is_empty() {
         format!("want {}\n", head_oid)
     } else {
-        format!("want {} {}\n", head_oid, want_caps)
+        format!("want {} {}\n", head_oid, caps_str)
     };
-    write_pkt_line(&mut stdin, want_line.as_bytes())?;
-    write_flush(&mut stdin)?;
-    write_pkt_line(&mut stdin, b"done\n")?;
-    stdin.flush()?;
 
-    drop(stdin);
+    write_pkt_line(&mut writer, want_line.as_bytes()).await?;
+    write_flush(&mut writer).await?;
+    write_pkt_line(&mut writer, b"done\n").await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+    drop(writer);
 
     let mut raw = Vec::new();
-    stdout.read_to_end(&mut raw)?;
+    reader.read_to_end(&mut raw).await?;
+    drop(reader);
 
+    // Skip ACK/NAK pkt-lines before the packfile
     let mut offset = 0;
     while offset + 8 <= raw.len() {
         let len_str = std::str::from_utf8(&raw[offset..offset + 4]).unwrap_or("xxxx");
-        if let Ok(len) = usize::from_str_radix(len_str, 16) && len >= 4 {
-            let content = &raw[offset + 4..offset + len];
-            if content.starts_with(b"NAK") || content.starts_with(b"ACK") {
-                offset += len;
-                continue;
+        if let Ok(len) = usize::from_str_radix(len_str, 16) {
+            if len >= 4 && offset + len <= raw.len() {
+                let content = &raw[offset + 4..offset + len];
+                if content.starts_with(b"NAK") || content.starts_with(b"ACK") {
+                    offset += len;
+                    continue;
+                }
             }
         }
         break;
     }
     let packfile = raw[offset..].to_vec();
 
-    child.wait()?;
-
-    Ok(FetchResult { head_commit_oid: head_oid, packfile })
+    Ok(FetchResult {
+        head_commit_oid: head_oid,
+        packfile,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Push protocol
 // ---------------------------------------------------------------------------
 
-pub fn do_push(
+pub async fn do_push(
     remote_url: &str,
     branch: &str,
     ssh_key: Option<&str>,
@@ -306,7 +415,7 @@ pub fn do_push(
     packfile: &[u8],
 ) -> Result<bool> {
     for attempt in 1..=MAX_RETRIES {
-        match try_push(remote_url, branch, ssh_key, password, new_commit_oid, packfile) {
+        match try_push(remote_url, branch, ssh_key, password, new_commit_oid, packfile).await {
             Ok(true) => return Ok(true),
             Ok(false) => {
                 tracing::warn!("push attempt {} returned non-fast-forward", attempt);
@@ -324,7 +433,7 @@ pub fn do_push(
     bail!("push failed after {} attempts", MAX_RETRIES);
 }
 
-fn try_push(
+async fn try_push(
     remote_url: &str,
     branch: &str,
     ssh_key: Option<&str>,
@@ -332,11 +441,19 @@ fn try_push(
     new_commit_oid: ObjectId,
     packfile: &[u8],
 ) -> Result<bool> {
-    let (mut child, mut stdout) =
-        spawn_ssh(remote_url, ssh_key, password, "git-receive-pack")?;
-    let mut stdin = child.stdin.take().context("no stdin from ssh")?;
+    let target = parse_ssh_url(remote_url)?;
+    let session = connect_ssh(&target, ssh_key, password).await?;
 
-    let adv = read_refs(&mut stdout)?;
+    let channel = session.channel_open_session().await?;
+    channel
+        .exec(true, format!("git-receive-pack '{}'", target.path))
+        .await?;
+    let stream = channel.into_stream();
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut writer = write_half;
+
+    let adv = read_refs(&mut reader).await?;
 
     let head_ref = format!("refs/heads/{}", branch);
     let old_oid = adv
@@ -346,7 +463,8 @@ fn try_push(
         .unwrap_or(ObjectId::from([0u8; 20]));
 
     let push_caps = ["report-status", "side-band-64k", "quiet", "agent"];
-    let caps_str = adv.capabilities
+    let caps_str = adv
+        .capabilities
         .split_ascii_whitespace()
         .filter(|c| {
             let name = c.split('=').next().unwrap_or(c);
@@ -356,24 +474,25 @@ fn try_push(
         .join(" ");
 
     let cmd_line = format!(
-        "{} {} {}\0{}\n",
-        old_oid, new_commit_oid, head_ref, caps_str
+        "{old} {new} {ref}\0{caps}\n",
+        old = old_oid,
+        new = new_commit_oid,
+        ref = head_ref,
+        caps = caps_str,
     );
-    write_pkt_line(&mut stdin, cmd_line.as_bytes())?;
-    write_flush(&mut stdin)?;
 
-    stdin.write_all(packfile)?;
-    stdin.flush()?;
-
-    drop(stdin);
+    write_pkt_line(&mut writer, cmd_line.as_bytes()).await?;
+    write_flush(&mut writer).await?;
+    writer.write_all(packfile).await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+    drop(writer);
 
     let mut report = String::new();
-    while let Some(data) = read_pkt_line(&mut stdout)? {
-        let line = String::from_utf8_lossy(&data);
-        report.push_str(&line);
+    while let Some(data) = read_pkt_line(&mut reader).await? {
+        report.push_str(&String::from_utf8_lossy(&data));
     }
-
-    child.wait()?;
+    drop(reader);
 
     if report.contains("unpack ok") && report.contains("ok") {
         Ok(true)
@@ -381,7 +500,9 @@ fn try_push(
         || report.contains("fetch first")
         || report.contains("NG")
     {
-        let detail = report.lines().find(|l| l.contains("NG"))
+        let detail = report
+            .lines()
+            .find(|l| l.contains("NG"))
             .or_else(|| report.lines().find(|l| l.contains("non-fast")))
             .or_else(|| report.lines().find(|l| l.contains("fetch first")))
             .unwrap_or(&report);

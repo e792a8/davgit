@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         &author_name,
         &author_email,
     )
+    .await
     .context("failed to initialize and fetch from remote")?;
 
     let git = Arc::new(git_repo);
