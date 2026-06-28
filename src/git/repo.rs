@@ -253,6 +253,7 @@ impl GitRepo {
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
+            Some(1),
         )
         .await
         {
@@ -319,6 +320,7 @@ impl GitRepo {
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
+            Some(1),
         )
         .await?;
         let head = result.head_commit_oid;

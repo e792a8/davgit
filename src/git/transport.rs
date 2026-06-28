@@ -326,9 +326,10 @@ pub async fn do_fetch(
     branch: &str,
     ssh_key: Option<&str>,
     password: Option<&str>,
+    depth: Option<u32>,
 ) -> Result<FetchResult> {
     for attempt in 1..=MAX_RETRIES {
-        match try_fetch(remote_url, branch, ssh_key, password).await {
+        match try_fetch(remote_url, branch, ssh_key, password, depth).await {
             Ok(result) => return Ok(result),
             Err(e) if attempt < MAX_RETRIES => {
                 tracing::warn!("fetch attempt {} failed (will retry): {}", attempt, e);
@@ -347,6 +348,7 @@ async fn try_fetch(
     branch: &str,
     ssh_key: Option<&str>,
     password: Option<&str>,
+    depth: Option<u32>,
 ) -> Result<FetchResult> {
     let target = parse_ssh_url(remote_url)?;
     let session = connect_ssh(&target, ssh_key, password).await?;
@@ -374,14 +376,19 @@ async fn try_fetch(
         "multi_ack_detailed",
         "no-progress",
         "ofs-delta",
+        "shallow",
     ];
 
-    let caps_str = adv
-        .capabilities
-        .split_ascii_whitespace()
+    let server_caps: Vec<&str> = adv.capabilities.split_ascii_whitespace().collect();
+
+    let caps_str = server_caps
+        .iter()
         .filter(|c| supported_caps.contains(c))
+        .copied()
         .collect::<Vec<_>>()
         .join(" ");
+
+    let server_has_shallow = server_caps.contains(&"shallow");
 
     let want_line = if caps_str.is_empty() {
         format!("want {}\n", head_oid)
@@ -390,6 +397,11 @@ async fn try_fetch(
     };
 
     write_pkt_line(&mut writer, want_line.as_bytes()).await?;
+
+    if server_has_shallow && let Some(n) = depth {
+        write_pkt_line(&mut writer, format!("deepen {}\n", n).as_bytes()).await?;
+    }
+
     write_flush(&mut writer).await?;
     write_pkt_line(&mut writer, b"done\n").await?;
     writer.flush().await?;
@@ -400,23 +412,10 @@ async fn try_fetch(
     reader.read_to_end(&mut raw).await?;
     drop(reader);
 
-    // Skip ACK/NAK pkt-lines before the packfile
-    let mut offset = 0;
-    while offset + 8 <= raw.len() {
-        let len_str = std::str::from_utf8(&raw[offset..offset + 4]).unwrap_or("xxxx");
-        if let Ok(len) = usize::from_str_radix(len_str, 16)
-            && len >= 4
-            && offset + len <= raw.len()
-        {
-            let content = &raw[offset + 4..offset + len];
-            if content.starts_with(b"NAK") || content.starts_with(b"ACK") {
-                offset += len;
-                continue;
-            }
-        }
-        break;
-    }
-    let packfile = raw[offset..].to_vec();
+    // Find the packfile by its PACK magic bytes, skipping any
+    // ACK/NAK/shallow/0000 pkt-lines that precede it.
+    let pack_start = raw.windows(4).position(|w| w == b"PACK").unwrap_or(0);
+    let packfile = raw[pack_start..].to_vec();
 
     Ok(FetchResult {
         head_commit_oid: head_oid,
