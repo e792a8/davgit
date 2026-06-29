@@ -31,6 +31,7 @@ pub struct GitRepo {
     index: Mutex<HashMap<PathBuf, ObjectId>>,
     dirs: Mutex<HashSet<PathBuf>>,
     last_fetch: Mutex<Instant>,
+    known_oids: Mutex<Vec<ObjectId>>,
 }
 
 impl GitRepo {
@@ -65,6 +66,7 @@ impl GitRepo {
             index: Mutex::new(HashMap::new()),
             dirs: Mutex::new(HashSet::new()),
             last_fetch: Mutex::new(Instant::now()),
+            known_oids: Mutex::new(Vec::new()),
         };
 
         repo.try_fetch_and_cache(None).await;
@@ -248,12 +250,15 @@ impl GitRepo {
     // -----------------------------------------------------------------------
 
     async fn try_fetch_and_cache(&self, _is_refresh: Option<bool>) -> bool {
+        let known = self.known_oids.lock().unwrap().clone();
         let result = match do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
             Some(1),
+            &known,
+            &known,
         )
         .await
         {
@@ -265,7 +270,13 @@ impl GitRepo {
             }
         };
 
-        let objects = match parse_packfile(&result.packfile) {
+        if result.packfile.is_empty() {
+            tracing::debug!("fetch: no new objects (server had everything)");
+            *self.last_fetch.lock().unwrap() = Instant::now();
+            return true;
+        }
+
+        let new_objects = match parse_packfile(&result.packfile) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!("parse_packfile failed: {}", e);
@@ -276,9 +287,8 @@ impl GitRepo {
 
         let head = result.head_commit_oid;
 
-        // Extract tree_oid before consuming objects
         let tree_oid = {
-            let commit_data = match objects.get(&head) {
+            let commit_data = match new_objects.get(&head) {
                 Some(c) => c,
                 None => {
                     tracing::warn!("HEAD commit not found in fetched packfile");
@@ -298,7 +308,10 @@ impl GitRepo {
             commit.tree().to_owned()
         };
 
-        let (index, _contents) = match build_index_and_contents(&objects, &tree_oid) {
+        let mut merged = self.objects.lock().unwrap().clone();
+        merged.extend(new_objects);
+
+        let (index, _contents) = match build_index_and_contents(&merged, &tree_oid) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("build_index failed: {}", e);
@@ -307,41 +320,98 @@ impl GitRepo {
             }
         };
 
+        Self::prune_objects(&mut merged, &index, &tree_oid, &head, &known);
+
         *self.head_oid.lock().unwrap() = Some(head);
-        *self.objects.lock().unwrap() = objects;
+        *self.objects.lock().unwrap() = merged;
         *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
+
+        {
+            let mut known = self.known_oids.lock().unwrap();
+            if !known.contains(&head) {
+                known.push(head);
+            }
+        }
+
         true
     }
 
     async fn fetch_for_write(&self) -> Result<(HashMap<PathBuf, Vec<u8>>, ObjectId)> {
+        let known = self.known_oids.lock().unwrap().clone();
         let result = do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
             Some(1),
+            &known,
+            &known,
         )
         .await?;
         let head = result.head_commit_oid;
-        let objects = parse_packfile(&result.packfile)?;
+
+        if result.packfile.is_empty() {
+            tracing::debug!("fetch_for_write: no new objects, using cached state");
+            let objects = self.objects.lock().unwrap().clone();
+            let index = self.index.lock().unwrap().clone();
+            *self.head_oid.lock().unwrap() = Some(head);
+            *self.last_fetch.lock().unwrap() = Instant::now();
+            let files = index.iter().filter_map(|(path, oid)| {
+                objects.get(oid).map(|data| (path.clone(), data.clone()))
+            }).collect();
+            return Ok((files, head));
+        }
+
+        let new_objects = parse_packfile(&result.packfile)?;
 
         let tree_oid = {
-            let tree_data = objects
+            let tree_data = new_objects
                 .get(&head)
                 .context("HEAD commit not found in fetched packfile")?;
             let commit = gix_object::CommitRef::from_bytes(tree_data, gix_hash::Kind::Sha1)?;
             commit.tree().to_owned()
         };
 
-        let (index, files) = build_index_and_contents(&objects, &tree_oid)?;
+        let mut merged = self.objects.lock().unwrap().clone();
+        merged.extend(new_objects);
+
+        let (index, files) = build_index_and_contents(&merged, &tree_oid)?;
+
+        Self::prune_objects(&mut merged, &index, &tree_oid, &head, &known);
 
         *self.head_oid.lock().unwrap() = Some(head);
-        *self.objects.lock().unwrap() = objects;
+        *self.objects.lock().unwrap() = merged;
         *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
 
+        {
+            let mut known = self.known_oids.lock().unwrap();
+            if !known.contains(&head) {
+                known.push(head);
+            }
+        }
+
         Ok((files, head))
+    }
+
+    /// Prune the objects map to keep only what's needed by the current tree
+    /// plus known OIDs for future shallow/have commands.
+    fn prune_objects(
+        objects: &mut HashMap<ObjectId, Vec<u8>>,
+        index: &HashMap<PathBuf, ObjectId>,
+        tree_oid: &ObjectId,
+        head: &ObjectId,
+        known: &[ObjectId],
+    ) {
+        let needed: HashSet<ObjectId> = index
+            .values()
+            .copied()
+            .chain(std::iter::once(*tree_oid))
+            .chain(std::iter::once(*head))
+            .chain(known.iter().copied())
+            .collect();
+        objects.retain(|k, _| needed.contains(k));
     }
 
     async fn commit_and_push(

@@ -327,9 +327,11 @@ pub async fn do_fetch(
     ssh_key: Option<&str>,
     password: Option<&str>,
     depth: Option<u32>,
+    shallow_oids: &[ObjectId],
+    have_oids: &[ObjectId],
 ) -> Result<FetchResult> {
     for attempt in 1..=MAX_RETRIES {
-        match try_fetch(remote_url, branch, ssh_key, password, depth).await {
+        match try_fetch(remote_url, branch, ssh_key, password, depth, shallow_oids, have_oids).await {
             Ok(result) => return Ok(result),
             Err(e) if attempt < MAX_RETRIES => {
                 tracing::warn!("fetch attempt {} failed (will retry): {}", attempt, e);
@@ -349,6 +351,8 @@ async fn try_fetch(
     ssh_key: Option<&str>,
     password: Option<&str>,
     depth: Option<u32>,
+    shallow_oids: &[ObjectId],
+    have_oids: &[ObjectId],
 ) -> Result<FetchResult> {
     let target = parse_ssh_url(remote_url)?;
     let session = connect_ssh(&target, ssh_key, password).await?;
@@ -398,8 +402,16 @@ async fn try_fetch(
 
     write_pkt_line(&mut writer, want_line.as_bytes()).await?;
 
+    for oid in shallow_oids {
+        write_pkt_line(&mut writer, format!("shallow {}\n", oid).as_bytes()).await?;
+    }
+
     if server_has_shallow && let Some(n) = depth {
         write_pkt_line(&mut writer, format!("deepen {}\n", n).as_bytes()).await?;
+    }
+
+    for oid in have_oids {
+        write_pkt_line(&mut writer, format!("have {}\n", oid).as_bytes()).await?;
     }
 
     write_flush(&mut writer).await?;
@@ -414,7 +426,8 @@ async fn try_fetch(
 
     // Find the packfile by its PACK magic bytes, skipping any
     // ACK/NAK/shallow/0000 pkt-lines that precede it.
-    let pack_start = raw.windows(4).position(|w| w == b"PACK").unwrap_or(0);
+    // If no PACK found, the server had nothing new (all objects known via have).
+    let pack_start = raw.windows(4).position(|w| w == b"PACK").unwrap_or(raw.len());
     let packfile = raw[pack_start..].to_vec();
 
     Ok(FetchResult {
