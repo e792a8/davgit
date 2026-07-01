@@ -13,11 +13,35 @@ use crate::git::GitRepo;
 // ---------------------------------------------------------------------------
 
 pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Response<Full<Bytes>> {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let span = tracing::info_span!("request", method = %method, path = %path);
+    let _guard = span.enter();
+
+    tracing::info!("← {} {}", method, path);
+
+    let dest = req.headers().get("destination").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(ref d) = dest {
+        tracing::debug!("  Destination: {}", d);
+    }
+    let depth = req.headers().get("depth").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(ref d) = depth {
+        tracing::debug!("  Depth: {}", d);
+    }
+    let overwrite = req.headers().get("overwrite").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(ref o) = overwrite {
+        tracing::debug!("  Overwrite: {}", o);
+    }
+    let content_len = req.headers().get("content-length").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    if let Some(ref cl) = content_len {
+        tracing::debug!("  Content-Length: {}", cl);
+    }
+
     git.refresh_if_stale().await;
 
     let rel_path = davpath_to_rel(req.uri().path());
 
-    match req.method().as_str() {
+    let resp = match req.method().as_str() {
         "GET" => handle_get(&rel_path, &req, &git).await,
         "HEAD" => handle_head(&rel_path, &req, &git).await,
         "PUT" => handle_put(&rel_path, req, &git).await,
@@ -25,13 +49,17 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
         "MKCOL" => handle_mkcol(&rel_path, req, &git).await,
         "OPTIONS" => handle_options(),
         "PROPFIND" => handle_propfind(&rel_path, &req, &git).await,
-        "PROPPATCH" => not_implemented(),
+        "PROPPATCH" => handle_proppatch(&rel_path, req, &git).await,
         "MOVE" => handle_copy_move(&rel_path, &req, &git, true).await,
         "COPY" => handle_copy_move(&rel_path, &req, &git, false).await,
-        "LOCK" => method_not_allowed(),
-        "UNLOCK" => method_not_allowed(),
+"LOCK" => handle_lock(&rel_path, req, &git).await,
+"UNLOCK" => handle_unlock(&rel_path, &git),
         _ => method_not_allowed(),
-    }
+    };
+
+    let status = resp.status().as_u16();
+    tracing::info!("→ {} {} ({} bytes)", status, method, resp.body().size_hint().lower());
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -79,22 +107,63 @@ async fn handle_head(path: &Path, req: &Request<Incoming>, git: &GitRepo) -> Res
 }
 
 async fn handle_put(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
-    // PUT to a non-existent parent must fail with 409
     let parent = path.parent().unwrap_or(Path::new(""));
-    if !parent.as_os_str().is_empty() && !git.is_directory(parent) {
+    let parent_exists = parent.as_os_str().is_empty() || git.is_directory(parent);
+    let file_exists = git.file_size(path).is_some() || git.is_directory(path);
+    tracing::debug!(
+        "  PUT {:?}: parent={:?} parent_exists={} file_exists={}",
+        path, parent, parent_exists, file_exists,
+    );
+
+    if !parent_exists {
+        tracing::warn!("  PUT parent not found: {:?}", parent);
         return conflict();
     }
 
+    // Handle If-None-Match: * — create only if not exists
+    if let Some(val) = req.headers().get("if-none-match")
+        && val.to_str().ok() == Some("*")
+    {
+        if file_exists {
+            tracing::debug!("  PUT If-None-Match: * → 412 (file exists)");
+            return precondition_failed();
+        }
+        tracing::debug!("  PUT If-None-Match: * → proceeding (file does not exist)");
+    }
+
+    // Handle If-Match: * — update only if exists
+    if let Some(val) = req.headers().get("if-match")
+        && val.to_str().ok() == Some("*")
+    {
+        if !file_exists {
+            tracing::debug!("  PUT If-Match: * → 412 (file does not exist)");
+            return precondition_failed();
+        }
+        tracing::debug!("  PUT If-Match: * → proceeding (file exists)");
+    }
+
     let data = match read_body(req.into_body()).await {
-        Ok(d) => d,
+        Ok(d) => {
+            tracing::debug!("  PUT body read: {} bytes", d.len());
+            d
+        }
         Err(e) => {
             tracing::error!("read body failed: {}", e);
             return internal_error();
         }
     };
 
+    // Windows Explorer sends 0-byte PUT as a "probe" before the real PUT with content.
+    // Don't create git objects for empty PUT on new files — avoids expensive commit+push
+    // and prevents the file from appearing before the real content arrives.
+    if data.is_empty() && !file_exists {
+        tracing::debug!("  PUT 0-byte probe on new file — acknowledging without write");
+        return created();
+    }
+
     match git.write_path(path, &data).await {
         Ok(_) => {
+            tracing::debug!("  PUT success: {} bytes written to {:?}", data.len(), path);
             if data.is_empty() {
                 no_content()
             } else {
@@ -109,6 +178,10 @@ async fn handle_put(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Respo
 }
 
 async fn handle_delete(path: &Path, git: &GitRepo) -> Response<Full<Bytes>> {
+    tracing::debug!(
+        "  DELETE {:?}: is_dir={} file_size={:?}",
+        path, git.is_directory(path), git.file_size(path)
+    );
     if git.is_directory(path) {
         let entries = match git.list_dir(path) {
             Ok(e) => e,
@@ -148,6 +221,10 @@ async fn handle_delete(path: &Path, git: &GitRepo) -> Response<Full<Bytes>> {
 }
 
 async fn handle_mkcol(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
+    tracing::debug!(
+        "  MKCOL {:?}: existing is_dir={} file_size={:?}",
+        path, git.is_directory(path), git.file_size(path)
+    );
     // Reject MKCOL with a body (RFC 4918 section 9.3.1: body must be ignored,
     // but litmus expects non-empty body to fail)
     let body_size = req.body().size_hint().exact();
@@ -186,7 +263,18 @@ async fn handle_propfind(
     req: &Request<Incoming>,
     git: &GitRepo,
 ) -> Response<Full<Bytes>> {
-    if !git.is_directory(path) && git.file_size(path).is_none() {
+    let exists = git.is_directory(path) || git.file_size(path).is_some();
+    tracing::debug!(
+        "  PROPFIND {:?}: depth={:?}, is_dir={}, file_size={:?}, exists={}",
+        path,
+        parse_depth(req.headers()),
+        git.is_directory(path),
+        git.file_size(path),
+        exists,
+    );
+
+    if !exists {
+        tracing::debug!("  PROPFIND not found: {:?}", path);
         return not_found();
     }
 
@@ -209,6 +297,10 @@ async fn handle_propfind(
         && is_dir
         && let Ok(entries) = git.list_dir(path)
     {
+        tracing::debug!("  PROPFIND listing {:?}: {} entries", path, entries.len());
+        for (name, entry_is_dir, entry_len) in &entries {
+            tracing::debug!("    {:?}: is_dir={} len={}", name, entry_is_dir, entry_len);
+        }
         for (name, entry_is_dir, entry_len) in entries {
             resources.push(PropfindResource {
                 path: path.join(&name),
@@ -236,10 +328,23 @@ async fn handle_copy_move(
 ) -> Response<Full<Bytes>> {
     let dest_path = match parse_destination(req) {
         Some(p) => p,
-        None => return bad_request(),
+        None => {
+            tracing::warn!("  COPY/MOVE missing or invalid Destination header");
+            return bad_request();
+        }
     };
 
+    tracing::debug!(
+        "  {} {:?} → {:?}: src_is_dir={} src_size={:?}, dest_exists={:?}",
+        if is_move { "MOVE" } else { "COPY" },
+        path, dest_path,
+        git.is_directory(path),
+        git.file_size(path),
+        if git.is_directory(&dest_path) { Some("dir") } else if git.file_size(&dest_path).is_some() { Some("file") } else { None }
+    );
+
     if !git.is_directory(path) && git.file_size(path).is_none() {
+        tracing::warn!("  {} source not found: {:?}", if is_move { "MOVE" } else { "COPY" }, path);
         return not_found();
     }
 
@@ -413,13 +518,6 @@ fn method_not_allowed() -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-fn not_implemented() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(501)
-        .body(Full::default())
-        .unwrap()
-}
-
 fn bad_request() -> Response<Full<Bytes>> {
     Response::builder()
         .status(400)
@@ -459,6 +557,64 @@ fn davpath_to_rel(s: &str) -> PathBuf {
     } else {
         PathBuf::from(s)
     }
+}
+
+async fn handle_proppatch(path: &Path, req: Request<Incoming>, _git: &GitRepo) -> Response<Full<Bytes>> {
+    // Read (and ignore) the request body — no XML parser dependency.
+    // Windows Explorer uses PROPPATCH to set file timestamps after PUT.
+    // Return 207 Multistatus OK so Windows doesn't error out.
+    let _ = read_body(req.into_body()).await;
+
+    let path_encoded = href_encode(path);
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>{0}</D:href><D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        path_encoded,
+    );
+
+    Response::builder()
+        .status(207)
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(Full::from(body))
+        .unwrap()
+}
+
+async fn handle_lock(path: &Path, req: Request<Incoming>, _git: &GitRepo) -> Response<Full<Bytes>> {
+    // Read (and ignore) the request body — spec requires it, Windows sends it
+    let _ = read_body(req.into_body()).await;
+
+    let token = generate_lock_token(path);
+
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>0</D:depth><D:timeout>Infinite</D:timeout><D:locktoken><D:href>opaquelocktoken:{}</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>"#,
+        token,
+    );
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(Full::from(body))
+        .unwrap()
+}
+
+fn handle_unlock(_path: &Path, _git: &GitRepo) -> Response<Full<Bytes>> {
+    no_content()
+}
+
+fn generate_lock_token(path: &Path) -> String {
+    use sha1::Digest;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(now.as_nanos().to_le_bytes());
+    hasher.update(path.to_str().unwrap_or(""));
+    hasher.update(count.to_le_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn href_encode(path: &Path) -> String {
