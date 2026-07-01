@@ -1,0 +1,3 @@
+[submodule "tests/litmus"]
+	path = tests/litmus
+	url = https://github.com/notroj/litmus

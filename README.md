@@ -116,6 +116,20 @@ cargo build --release
 - **Packfile**: `sha1`, `flate2`, `smallvec`
 - **CLI**: `clap`
 
+## Testing
+
+Run the WebDAV compliance test suite (litmus) against a live server:
+
+```bash
+# Initialize the litmus submodule (first time only)
+git submodule update --init --recursive
+
+# Run all suites
+REMOTE_URL='git@github.com:user/repo.git' cargo test --features litmus-tests --release
+```
+
+The litmus submodule at `tests/litmus/` is automatically built (autogen.sh → configure → make) once per test run. System dependencies: `autoconf`, `automake`, `libtool`, `gcc`, `make`, `libneon-dev`.
+
 ## License
 
 MIT

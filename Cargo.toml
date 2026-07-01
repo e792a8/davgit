@@ -28,3 +28,9 @@ sha1 = "0.10"
 flate2 = "1"
 hex = "0.4"
 russh = "0.61"
+
+[features]
+litmus-tests = []
+
+[dev-dependencies]
+# Only needed for litmus integration tests (used via env var)

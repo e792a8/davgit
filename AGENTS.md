@@ -66,6 +66,17 @@ git/objects.rs:   tree walk/index build, commit build
 | copymove | 10/13 | 3 | copy_coll overwrite (404), copy_shallow cascading, move_coll (404) |
 | locks | 0 | all | LOCK/UNLOCK return 405 |
 
+## Litmus integration tests
+- **Submodule**: `tests/litmus/` → `github.com/notroj/litmus` (includes neon submodule)
+- **Auto-build**: `build_litmus()` runs `autogen.sh → ./configure → make` only when Makefile is missing
+- **Once per run**: `std::sync::Once` ensures C build happens exactly once
+- **Run**:
+  ```bash
+  git submodule update --init --recursive
+  REMOTE_URL='git@example.com:user/repo.git' cargo test --features litmus-tests --release
+  ```
+- **System deps**: `autoconf`, `automake`, `libtool`, `gcc`, `make`, `libneon-dev`
+
 ## Critical context
 - **`russh` SSH client flow**: `client::connect(addr, config, handler)` → `authenticate_publickey` or `authenticate_publickey_with(agent)` → `channel_open_session()` → `exec("git-upload-pack /path")` → `channel.into_stream()` → `tokio::io::split()` → async read/write for git pkt-line protocol.
 - **Agent auth**: `AgentClient::connect_env()` reads `$SSH_AUTH_SOCK`. `request_identities()` → `Vec<AgentIdentity>`. `authenticate_publickey_with(user, identity.public_key().into_owned(), None, &mut agent)`.
