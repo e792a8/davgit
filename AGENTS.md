@@ -73,7 +73,7 @@ git/objects.rs:   tree walk/index build, commit build
 - **Run**:
   ```bash
   git submodule update --init --recursive
-  REMOTE_URL='git@example.com:user/repo.git' cargo test --features litmus-tests --release
+  REMOTE_URL='git@example.com:user/repo.git' cargo test --features litmus-tests --release -- --no-capture
   ```
 - **System deps**: `autoconf`, `automake`, `libtool`, `gcc`, `make`, `libneon-dev`
 

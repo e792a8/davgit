@@ -125,7 +125,7 @@ Run the WebDAV compliance test suite (litmus) against a live server:
 git submodule update --init --recursive
 
 # Run all suites
-REMOTE_URL='git@github.com:user/repo.git' cargo test --features litmus-tests --release
+REMOTE_URL='git@example.com:user/repo.git' cargo test --features litmus-tests --release -- --no-capture
 ```
 
 The litmus submodule at `tests/litmus/` is automatically built (autogen.sh → configure → make) once per test run. System dependencies: `autoconf`, `automake`, `libtool`, `gcc`, `make`, `libneon-dev`.

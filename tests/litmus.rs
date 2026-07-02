@@ -9,7 +9,9 @@ static BUILD_LITMUS: Once = Once::new();
 
 /// Path to the litmus submodule checkout.
 fn litmus_root() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("litmus");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("litmus");
     assert!(p.exists(), "litmus submodule not found at {}", p.display());
     p
 }
@@ -41,7 +43,9 @@ fn build_litmus() {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 fn litmus_bin(name: &str) -> PathBuf {
@@ -49,13 +53,15 @@ fn litmus_bin(name: &str) -> PathBuf {
 }
 
 fn server_exe() -> PathBuf {
-    std::env::var("CARGO_BIN_EXE_DAVGIT").map(PathBuf::from).unwrap_or_else(|_| {
-        let p = PathBuf::from("target/release/davgit");
-        if p.exists() {
-            return p;
-        }
-        PathBuf::from("target/debug/davgit")
-    })
+    std::env::var("CARGO_BIN_EXE_DAVGIT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let p = PathBuf::from("target/release/davgit");
+            if p.exists() {
+                return p;
+            }
+            PathBuf::from("target/debug/davgit")
+        })
 }
 
 struct ServerGuard(Child, u16);
@@ -65,6 +71,19 @@ impl ServerGuard {
         let exe = server_exe();
         let remote_url =
             std::env::var("REMOTE_URL").expect("REMOTE_URL must be set for litmus tests");
+
+        let stdout = match std::env::var("DAVGIT_LOG_FILE") {
+            Ok(path) => {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap_or_else(|e| panic!("failed to open DAVGIT_LOG_FILE {path:?}: {e}"));
+                std::process::Stdio::from(file)
+            }
+            Err(_) => std::process::Stdio::null(),
+        };
+
         let child = Command::new(exe)
             .arg("--remote-url")
             .arg(&remote_url)
@@ -72,7 +91,7 @@ impl ServerGuard {
             .arg("main")
             .arg("--port")
             .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
+            .stdout(stdout)
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("failed to start davgit");
@@ -116,23 +135,6 @@ fn run_suite(name: &str, port: u16) -> Output {
     output
 }
 
-fn assert_passed(output: &Output, expected_min: usize) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Some(summary) = stdout.lines().find(|l| l.contains("summary")) {
-        let passed = summary
-            .split(|c: char| !c.is_ascii_digit())
-            .filter_map(|s| s.parse::<usize>().ok())
-            .next()
-            .unwrap_or(0);
-        assert!(
-            passed >= expected_min,
-            "expected at least {} passed, got {}",
-            expected_min,
-            passed
-        );
-    }
-}
-
 #[test]
 fn litmus_basic() {
     let server = ServerGuard::start(18080);
@@ -154,7 +156,7 @@ fn litmus_props() {
     let server = ServerGuard::start(18082);
     server.wait_ready(Duration::from_secs(15));
     let out = run_suite("props", 18082);
-    assert_passed(&out, 9);
+    assert!(out.status.success());
 }
 
 #[test]
@@ -162,7 +164,7 @@ fn litmus_copymove() {
     let server = ServerGuard::start(18083);
     server.wait_ready(Duration::from_secs(15));
     let out = run_suite("copymove", 18083);
-    assert_passed(&out, 10);
+    assert!(out.status.success());
 }
 
 #[test]
@@ -170,6 +172,5 @@ fn litmus_locks() {
     let server = ServerGuard::start(18084);
     server.wait_ready(Duration::from_secs(15));
     let out = run_suite("locks", 18084);
-    println!("(expected all fail — LOCK is 501)");
-    let _ = out;
+    assert!(out.status.success());
 }
