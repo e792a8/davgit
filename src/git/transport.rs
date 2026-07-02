@@ -331,7 +331,17 @@ pub async fn do_fetch(
     have_oids: &[ObjectId],
 ) -> Result<FetchResult> {
     for attempt in 1..=MAX_RETRIES {
-        match try_fetch(remote_url, branch, ssh_key, password, depth, shallow_oids, have_oids).await {
+        match try_fetch(
+            remote_url,
+            branch,
+            ssh_key,
+            password,
+            depth,
+            shallow_oids,
+            have_oids,
+        )
+        .await
+        {
             Ok(result) => return Ok(result),
             Err(e) if attempt < MAX_RETRIES => {
                 tracing::warn!("fetch attempt {} failed (will retry): {}", attempt, e);
@@ -427,7 +437,10 @@ async fn try_fetch(
     // Find the packfile by its PACK magic bytes, skipping any
     // ACK/NAK/shallow/0000 pkt-lines that precede it.
     // If no PACK found, the server had nothing new (all objects known via have).
-    let pack_start = raw.windows(4).position(|w| w == b"PACK").unwrap_or(raw.len());
+    let pack_start = raw
+        .windows(4)
+        .position(|w| w == b"PACK")
+        .unwrap_or(raw.len());
     let packfile = raw[pack_start..].to_vec();
 
     Ok(FetchResult {

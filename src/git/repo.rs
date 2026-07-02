@@ -5,15 +5,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::git::objects::{build_commit, build_index_and_contents, build_trees};
-use crate::git::packfile::{OBJ_COMMIT, ObjectId, build_packfile, hash_object, parse_packfile};
+use crate::git::objects::{
+    build_commit, build_index_and_contents, copy_tree_entry, find_tree_entry, modify_tree_entry,
+    remove_tree_entry,
+};
+use crate::git::packfile::{
+    OBJ_BLOB, OBJ_COMMIT, ObjectId, build_packfile, hash_object, parse_packfile,
+};
 use crate::git::transport::do_fetch;
 use crate::git::transport::do_push;
 
 const FETCH_THROTTLE: Duration = Duration::from_secs(3);
 const MAX_RETRIES: u32 = 3;
-
-type ObjectList = Vec<(u8, Vec<u8>)>;
 
 // ---------------------------------------------------------------------------
 // GitRepo – public API
@@ -29,7 +32,6 @@ pub struct GitRepo {
     head_oid: Mutex<Option<ObjectId>>,
     objects: Mutex<HashMap<ObjectId, Vec<u8>>>,
     index: Mutex<HashMap<PathBuf, ObjectId>>,
-    dirs: Mutex<HashSet<PathBuf>>,
     last_fetch: Mutex<Instant>,
     known_oids: Mutex<Vec<ObjectId>>,
 }
@@ -64,7 +66,6 @@ impl GitRepo {
             head_oid: Mutex::new(None),
             objects: Mutex::new(HashMap::new()),
             index: Mutex::new(HashMap::new()),
-            dirs: Mutex::new(HashSet::new()),
             last_fetch: Mutex::new(Instant::now()),
             known_oids: Mutex::new(Vec::new()),
         };
@@ -102,7 +103,6 @@ impl GitRepo {
     pub fn list_dir(&self, path: &Path) -> Result<Vec<(String, bool, u64)>> {
         let index = self.index.lock().unwrap();
         let objects = self.objects.lock().unwrap();
-        let dirs = self.dirs.lock().unwrap();
 
         let prefix = if path.as_os_str().is_empty() {
             PathBuf::new()
@@ -115,7 +115,6 @@ impl GitRepo {
         let mut entries: Vec<(String, bool, u64)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // Collect from the file index
         for key in index.keys() {
             if let Ok(rel) = key.strip_prefix(&prefix) {
                 if rel.as_os_str().is_empty() {
@@ -140,22 +139,6 @@ impl GitRepo {
             }
         }
 
-        // Collect empty directories (dir markers)
-        for dir_path in dirs.iter() {
-            if let Ok(rel) = dir_path.strip_prefix(&prefix) {
-                if rel.as_os_str().is_empty() {
-                    continue;
-                }
-                let first = rel.components().next().unwrap();
-                let name = first.as_os_str().to_string_lossy().to_string();
-                if seen.contains(&name) {
-                    continue;
-                }
-                seen.insert(name.clone());
-                entries.push((name, true, 0));
-            }
-        }
-
         Ok(entries)
     }
 
@@ -165,16 +148,9 @@ impl GitRepo {
             return true; // root is always a directory
         }
         let index = self.index.lock().unwrap();
-        let dirs = self.dirs.lock().unwrap();
-        if dirs.contains(path) {
-            return true;
-        }
-        // Check if any index key is a child of `path` (not `path` itself)
-        let has_child = index.keys().any(|k| k != path && k.starts_with(path));
-        if has_child {
-            return true;
-        }
-        false
+        // A directory exists if any index key (other than the path itself)
+        // starts with this path.
+        index.keys().any(|k| k != path && k.starts_with(path))
     }
 
     /// Get the content length of a file.
@@ -185,14 +161,15 @@ impl GitRepo {
         objects.get(oid).map(|d| d.len() as u64)
     }
 
-    /// Notify that a directory was created (MKCOL) — tracked in-memory.
-    pub fn create_dir(&self, path: &Path) {
-        self.dirs.lock().unwrap().insert(path.to_path_buf());
-    }
-
-    /// Remove a directory marker (empty dir) from in-memory tracking.
-    pub fn remove_dir_marker(&self, path: &Path) {
-        self.dirs.lock().unwrap().remove(path);
+    /// Create a directory by committing a ".DAV" marker file in it.
+    pub async fn create_dir(&self, path: &Path) -> Result<()> {
+        let msg = format!("create dir {:?}", path);
+        for _ in 0..MAX_RETRIES {
+            if self.try_create_dir(path, &msg).await? {
+                return Ok(());
+            }
+        }
+        bail!("create dir failed after {} attempts", MAX_RETRIES);
     }
 
     // -----------------------------------------------------------------------
@@ -227,22 +204,6 @@ impl GitRepo {
             }
         }
         bail!("delete failed after {} attempts", MAX_RETRIES);
-    }
-
-    pub async fn batch_paths(
-        &self,
-        writes: &[(PathBuf, Vec<u8>)],
-        deletes: &[PathBuf],
-    ) -> Result<()> {
-        for _ in 0..MAX_RETRIES {
-            if self
-                .commit_and_push(writes, deletes, "batch update")
-                .await?
-            {
-                return Ok(());
-            }
-        }
-        bail!("batch commit failed after {} attempts", MAX_RETRIES);
     }
 
     // -----------------------------------------------------------------------
@@ -337,7 +298,9 @@ impl GitRepo {
         true
     }
 
-    async fn fetch_for_write(&self) -> Result<(HashMap<PathBuf, Vec<u8>>, ObjectId)> {
+    /// Fetch latest objects and return (merged_objects, head_oid, tree_oid).
+    /// Does NOT build the file contents HashMap — avoids loading all file data.
+    async fn fetch_and_merge(&self) -> Result<(HashMap<ObjectId, Vec<u8>>, ObjectId, ObjectId)> {
         let known = self.known_oids.lock().unwrap().clone();
         let result = do_fetch(
             &self.remote_url,
@@ -349,98 +312,80 @@ impl GitRepo {
             &known,
         )
         .await?;
-        let head = result.head_commit_oid;
 
         if result.packfile.is_empty() {
-            tracing::debug!("fetch_for_write: no new objects, using cached state");
+            // No new objects from server. Use our cached state — the server's ref
+            // may have been advanced by another concurrent server, but our tree
+            // is still correct (no objects changed for us).
+            tracing::debug!("fetch: no new objects, using cached state");
+            let head = self.head_oid.lock().unwrap().context("no cached HEAD")?;
             let objects = self.objects.lock().unwrap().clone();
-            let index = self.index.lock().unwrap().clone();
-            *self.head_oid.lock().unwrap() = Some(head);
+            let tree_oid = {
+                let commit_data = objects
+                    .get(&head)
+                    .context("cached HEAD commit not found in objects")?;
+                let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
+                commit.tree().to_owned()
+            };
             *self.last_fetch.lock().unwrap() = Instant::now();
-            let files = index.iter().filter_map(|(path, oid)| {
-                objects.get(oid).map(|data| (path.clone(), data.clone()))
-            }).collect();
-            return Ok((files, head));
+            return Ok((objects, head, tree_oid));
         }
 
+        let head = result.head_commit_oid;
         let new_objects = parse_packfile(&result.packfile)?;
-
-        let tree_oid = {
-            let tree_data = new_objects
-                .get(&head)
-                .context("HEAD commit not found in fetched packfile")?;
-            let commit = gix_object::CommitRef::from_bytes(tree_data, gix_hash::Kind::Sha1)?;
-            commit.tree().to_owned()
-        };
-
         let mut merged = self.objects.lock().unwrap().clone();
         merged.extend(new_objects);
 
-        let (index, files) = build_index_and_contents(&merged, &tree_oid)?;
+        let tree_oid = {
+            let commit_data = merged
+                .get(&head)
+                .context("HEAD commit not found in fetched packfile")?;
+            let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
+            commit.tree().to_owned()
+        };
 
+        let (index, _) = build_index_and_contents(&merged, &tree_oid)?;
         Self::prune_objects(&mut merged, &index, &tree_oid, &head, &known);
 
         *self.head_oid.lock().unwrap() = Some(head);
-        *self.objects.lock().unwrap() = merged;
+        *self.objects.lock().unwrap() = merged.clone();
         *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
 
-        {
-            let mut known = self.known_oids.lock().unwrap();
-            if !known.contains(&head) {
-                known.push(head);
-            }
+        let mut known = self.known_oids.lock().unwrap();
+        if !known.contains(&head) {
+            known.push(head);
         }
 
-        Ok((files, head))
+        Ok((merged, head, tree_oid))
     }
 
-    /// Prune the objects map to keep only what's needed by the current tree
-    /// plus known OIDs for future shallow/have commands.
-    fn prune_objects(
-        objects: &mut HashMap<ObjectId, Vec<u8>>,
-        index: &HashMap<PathBuf, ObjectId>,
-        tree_oid: &ObjectId,
-        head: &ObjectId,
-        known: &[ObjectId],
-    ) {
-        let needed: HashSet<ObjectId> = index
-            .values()
-            .copied()
-            .chain(std::iter::once(*tree_oid))
-            .chain(std::iter::once(*head))
-            .chain(known.iter().copied())
-            .collect();
-        objects.retain(|k, _| needed.contains(k));
-    }
-
-    async fn commit_and_push(
+    /// Push a commit built from tree-delta objects and cache on success.
+    async fn push_with_cache(
         &self,
-        writes: &[(PathBuf, Vec<u8>)],
-        deletes: &[PathBuf],
-        message: &str,
+        parent_oid: ObjectId,
+        new_root_oid: ObjectId,
+        pack_objects: Vec<(u8, Vec<u8>)>,
+        msg: &str,
     ) -> Result<bool> {
-        let (mut files, parent_oid) = self.fetch_for_write().await?;
-
-        for (path, data) in writes {
-            files.insert(path.clone(), data.clone());
-        }
-        for path in deletes {
-            files.remove(path);
-        }
-
-        let (commit_oid, object_list) = build_change_commit(
-            &files,
-            Some(parent_oid),
+        let commit_data = build_commit(
+            &new_root_oid,
+            Some(&parent_oid),
             &self.author_name,
             &self.author_email,
-            message,
-        )?;
+            msg,
+        );
+        let commit_oid = hash_object(OBJ_COMMIT, &commit_data);
 
-        let entries: Vec<(u8, &[u8])> = object_list
-            .iter()
-            .map(|(k, v)| (*k, v.as_slice()))
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        seen.insert(commit_oid);
+        let mut deduped: Vec<(u8, Vec<u8>)> = pack_objects
+            .into_iter()
+            .filter(|(kind, data)| seen.insert(hash_object(*kind, data)))
             .collect();
+        deduped.push((OBJ_COMMIT, commit_data));
+
+        let entries: Vec<(u8, &[u8])> = deduped.iter().map(|(k, v)| (*k, v.as_slice())).collect();
         let packfile = build_packfile(&entries)?;
 
         let pushed = do_push(
@@ -454,59 +399,163 @@ impl GitRepo {
         .await?;
 
         if pushed {
-            // Cache the new commit and objects
-            let new_objects: HashMap<ObjectId, Vec<u8>> = object_list
-                .into_iter()
-                .map(|(kind, data)| (hash_object(kind, &data), data))
-                .collect();
-
-            {
-                let mut objects = self.objects.lock().unwrap();
-                for (oid, data) in new_objects {
-                    objects.entry(oid).or_insert(data);
-                }
+            let mut objects = self.objects.lock().unwrap();
+            for (kind, data) in deduped {
+                let oid = hash_object(kind, &data);
+                objects.entry(oid).or_insert(data);
             }
-
-            // Rebuild index from the new commit
-            let objects = self.objects.lock().unwrap();
-            let commit_data = objects.get(&commit_oid).context("new commit missing")?;
-            let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
-            let tree_oid: ObjectId = commit.tree().to_owned();
-            let (new_index, _new_files) = build_index_and_contents(&objects, &tree_oid)?;
+            let (new_index, _) = build_index_and_contents(&objects, &new_root_oid)?;
             *self.index.lock().unwrap() = new_index;
-
             *self.head_oid.lock().unwrap() = Some(commit_oid);
             *self.last_fetch.lock().unwrap() = Instant::now();
         }
 
         Ok(pushed)
     }
-}
 
-fn build_change_commit(
-    files: &HashMap<PathBuf, Vec<u8>>,
-    parent_oid: Option<ObjectId>,
-    author_name: &str,
-    author_email: &str,
-    message: &str,
-) -> Result<(ObjectId, ObjectList)> {
-    let (tree_oid, mut objects) = build_trees(files)?;
-    let commit_data = build_commit(
-        &tree_oid,
-        parent_oid.as_ref(),
-        author_name,
-        author_email,
-        message,
-    );
-    let commit_oid = hash_object(OBJ_COMMIT, &commit_data);
-    objects.push((OBJ_COMMIT, commit_data));
+    /// Prune the objects map to keep only what's needed by the current tree
+    /// plus known OIDs for future shallow/have commands.
+    /// Also keeps all reachable subtree tree OIDs for tree-based COPY/MOVE.
+    fn prune_objects(
+        objects: &mut HashMap<ObjectId, Vec<u8>>,
+        index: &HashMap<PathBuf, ObjectId>,
+        tree_oid: &ObjectId,
+        head: &ObjectId,
+        known: &[ObjectId],
+    ) {
+        let all_tree_oids = crate::git::objects::collect_tree_oids(objects, tree_oid);
+        let needed: HashSet<ObjectId> = index
+            .values()
+            .copied()
+            .chain(std::iter::once(*tree_oid))
+            .chain(std::iter::once(*head))
+            .chain(known.iter().copied())
+            .chain(all_tree_oids)
+            .collect();
+        objects.retain(|k, _| needed.contains(k));
+    }
 
-    // Deduplicate objects by OID (e.g. when same content exists at multiple paths)
-    let mut seen = std::collections::HashSet::new();
-    let deduped: ObjectList = objects
-        .into_iter()
-        .filter(|(kind, data)| seen.insert(hash_object(*kind, data)))
-        .collect();
+    // -----------------------------------------------------------------------
+    // Tree-based copy / move / delete
+    // -----------------------------------------------------------------------
 
-    Ok((commit_oid, deduped))
+    pub async fn copy_subtree(&self, src: &Path, dest: &Path) -> Result<()> {
+        let msg = format!("copy {:?} -> {:?}", src, dest);
+        for _ in 0..MAX_RETRIES {
+            if self.try_copy_or_move(src, dest, &msg, false).await? {
+                return Ok(());
+            }
+        }
+        bail!("copy failed after {} attempts", MAX_RETRIES);
+    }
+
+    pub async fn move_subtree(&self, src: &Path, dest: &Path) -> Result<()> {
+        let msg = format!("move {:?} -> {:?}", src, dest);
+        for _ in 0..MAX_RETRIES {
+            if self.try_copy_or_move(src, dest, &msg, true).await? {
+                return Ok(());
+            }
+        }
+        bail!("move failed after {} attempts", MAX_RETRIES);
+    }
+
+    /// Delete an entire tree entry (file or directory) at `path`.
+    /// Uses `remove_tree_entry` so a single call removes a subtree.
+    pub async fn delete_subtree(&self, path: &Path) -> Result<()> {
+        let msg = format!("delete {:?}", path);
+        for _ in 0..MAX_RETRIES {
+            if self.try_delete_subtree(path, &msg).await? {
+                return Ok(());
+            }
+        }
+        bail!("delete subtree failed after {} attempts", MAX_RETRIES);
+    }
+
+    async fn try_copy_or_move(
+        &self,
+        src: &Path,
+        dest: &Path,
+        msg: &str,
+        is_move: bool,
+    ) -> Result<bool> {
+        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+
+        let (tmp_root, mut tmp_objs) = if find_tree_entry(&objects, &tree_oid, dest)?.is_some() {
+            let (r, o) = remove_tree_entry(&mut objects, &tree_oid, dest)?;
+            (r, o)
+        } else {
+            (tree_oid, vec![])
+        };
+
+        let (copy_root, copy_objs) = copy_tree_entry(&mut objects, &tmp_root, src, dest)?;
+        tmp_objs.extend(copy_objs);
+
+        let final_root = if is_move {
+            let (r, o) = remove_tree_entry(&mut objects, &copy_root, src)?;
+            tmp_objs.extend(o);
+            r
+        } else {
+            copy_root
+        };
+
+        self.push_with_cache(parent_oid, final_root, tmp_objs, msg)
+            .await
+    }
+
+    async fn try_delete_subtree(&self, path: &Path, msg: &str) -> Result<bool> {
+        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+        let (new_root, objs) = remove_tree_entry(&mut objects, &tree_oid, path)?;
+        self.push_with_cache(parent_oid, new_root, objs, msg).await
+    }
+
+    async fn try_create_dir(&self, path: &Path, msg: &str) -> Result<bool> {
+        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+        let dav_path = path.join(".DAV");
+        let blob_oid = hash_object(OBJ_BLOB, b"");
+        objects.insert(blob_oid, b"".to_vec());
+        let (new_root, mut pack_objects) = modify_tree_entry(
+            &mut objects,
+            &tree_oid,
+            &dav_path,
+            Some((gix_object::tree::EntryKind::Blob.into(), blob_oid)),
+        )?;
+        pack_objects.push((OBJ_BLOB, b"".to_vec()));
+        self.push_with_cache(parent_oid, new_root, pack_objects, msg)
+            .await
+    }
+
+    /// Commit a batch of writes and deletes using tree deltas.
+    /// Writes are applied first, then deletes (preserving old semantics).
+    async fn commit_and_push(
+        &self,
+        writes: &[(PathBuf, Vec<u8>)],
+        deletes: &[PathBuf],
+        message: &str,
+    ) -> Result<bool> {
+        let (mut objects, parent_oid, mut tree_oid) = self.fetch_and_merge().await?;
+        let mut pack_objects = Vec::new();
+
+        for (path, data) in writes {
+            let blob_oid = hash_object(OBJ_BLOB, data);
+            objects.insert(blob_oid, data.clone());
+            let (new_root, objs) = modify_tree_entry(
+                &mut objects,
+                &tree_oid,
+                path,
+                Some((gix_object::tree::EntryKind::Blob.into(), blob_oid)),
+            )?;
+            tree_oid = new_root;
+            pack_objects.extend(objs);
+            pack_objects.push((OBJ_BLOB, data.clone()));
+        }
+
+        for path in deletes {
+            let (new_root, objs) = remove_tree_entry(&mut objects, &tree_oid, path)?;
+            tree_oid = new_root;
+            pack_objects.extend(objs);
+        }
+
+        self.push_with_cache(parent_oid, tree_oid, pack_objects, message)
+            .await
+    }
 }

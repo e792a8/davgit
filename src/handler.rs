@@ -20,19 +20,35 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
 
     tracing::info!("← {} {}", method, path);
 
-    let dest = req.headers().get("destination").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let dest = req
+        .headers()
+        .get("destination")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if let Some(ref d) = dest {
         tracing::debug!("  Destination: {}", d);
     }
-    let depth = req.headers().get("depth").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let depth = req
+        .headers()
+        .get("depth")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if let Some(ref d) = depth {
         tracing::debug!("  Depth: {}", d);
     }
-    let overwrite = req.headers().get("overwrite").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let overwrite = req
+        .headers()
+        .get("overwrite")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if let Some(ref o) = overwrite {
         tracing::debug!("  Overwrite: {}", o);
     }
-    let content_len = req.headers().get("content-length").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let content_len = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if let Some(ref cl) = content_len {
         tracing::debug!("  Content-Length: {}", cl);
     }
@@ -52,13 +68,18 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
         "PROPPATCH" => handle_proppatch(&rel_path, req, &git).await,
         "MOVE" => handle_copy_move(&rel_path, &req, &git, true).await,
         "COPY" => handle_copy_move(&rel_path, &req, &git, false).await,
-"LOCK" => handle_lock(&rel_path, req, &git).await,
-"UNLOCK" => handle_unlock(&rel_path, &git),
+        "LOCK" => handle_lock(&rel_path, req, &git).await,
+        "UNLOCK" => handle_unlock(&rel_path, &git),
         _ => method_not_allowed(),
     };
 
     let status = resp.status().as_u16();
-    tracing::info!("→ {} {} ({} bytes)", status, method, resp.body().size_hint().lower());
+    tracing::info!(
+        "→ {} {} ({} bytes)",
+        status,
+        method,
+        resp.body().size_hint().lower()
+    );
     resp
 }
 
@@ -66,8 +87,12 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
 // Handler functions
 // ---------------------------------------------------------------------------
 
+fn is_dav_path(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some(".DAV")
+}
+
 async fn handle_get(path: &Path, req: &Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
-    if git.is_directory(path) {
+    if is_dav_path(path) || git.is_directory(path) {
         return not_found();
     }
     match git.read_file(path) {
@@ -107,12 +132,18 @@ async fn handle_head(path: &Path, req: &Request<Incoming>, git: &GitRepo) -> Res
 }
 
 async fn handle_put(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
+    if is_dav_path(path) {
+        return method_not_allowed();
+    }
     let parent = path.parent().unwrap_or(Path::new(""));
     let parent_exists = parent.as_os_str().is_empty() || git.is_directory(parent);
     let file_exists = git.file_size(path).is_some() || git.is_directory(path);
     tracing::debug!(
         "  PUT {:?}: parent={:?} parent_exists={} file_exists={}",
-        path, parent, parent_exists, file_exists,
+        path,
+        parent,
+        parent_exists,
+        file_exists,
     );
 
     if !parent_exists {
@@ -178,52 +209,40 @@ async fn handle_put(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Respo
 }
 
 async fn handle_delete(path: &Path, git: &GitRepo) -> Response<Full<Bytes>> {
-    tracing::debug!(
-        "  DELETE {:?}: is_dir={} file_size={:?}",
-        path, git.is_directory(path), git.file_size(path)
-    );
+    if is_dav_path(path) {
+        return method_not_allowed();
+    }
+    let exists = git.is_directory(path) || git.file_size(path).is_some();
+    tracing::debug!("  DELETE {:?}: exists={}", path, exists);
+    if !exists {
+        return not_found();
+    }
+
     if git.is_directory(path) {
-        let entries = match git.list_dir(path) {
-            Ok(e) => e,
-            Err(_) => return internal_error(),
-        };
-        let deletes: Vec<PathBuf> = entries
-            .iter()
-            .filter(|(_, is_dir, _)| !*is_dir)
-            .map(|(name, _, _)| path.join(name))
-            .collect();
-        if !deletes.is_empty() {
-            match git.batch_paths(&[], &deletes).await {
-                Ok(_) => {
-                    git.remove_dir_marker(path);
-                    no_content()
-                }
-                Err(e) => {
-                    tracing::error!("batch_paths delete dir failed: {}", e);
-                    internal_error()
-                }
-            }
-        } else {
-            git.remove_dir_marker(path);
-            no_content()
-        }
-    } else if git.file_size(path).is_some() {
-        match git.delete_path(path).await {
+        match git.delete_subtree(path).await {
             Ok(_) => no_content(),
             Err(e) => {
-                tracing::error!("delete_path({:?}) failed: {}", path, e);
+                tracing::error!("delete_subtree {:?} failed: {}", path, e);
                 internal_error()
             }
         }
     } else {
-        not_found()
+        match git.delete_path(path).await {
+            Ok(_) => no_content(),
+            Err(e) => {
+                tracing::error!("delete_path {:?} failed: {}", path, e);
+                internal_error()
+            }
+        }
     }
 }
 
 async fn handle_mkcol(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Response<Full<Bytes>> {
     tracing::debug!(
         "  MKCOL {:?}: existing is_dir={} file_size={:?}",
-        path, git.is_directory(path), git.file_size(path)
+        path,
+        git.is_directory(path),
+        git.file_size(path)
     );
     // Reject MKCOL with a body (RFC 4918 section 9.3.1: body must be ignored,
     // but litmus expects non-empty body to fail)
@@ -241,8 +260,13 @@ async fn handle_mkcol(path: &Path, req: Request<Incoming>, git: &GitRepo) -> Res
     }
     // Drop the body explicitly
     drop(req);
-    git.create_dir(path);
-    created()
+    match git.create_dir(path).await {
+        Ok(_) => created(),
+        Err(e) => {
+            tracing::error!("create_dir({:?}) failed: {}", path, e);
+            internal_error()
+        }
+    }
 }
 
 fn handle_options() -> Response<Full<Bytes>> {
@@ -263,6 +287,9 @@ async fn handle_propfind(
     req: &Request<Incoming>,
     git: &GitRepo,
 ) -> Response<Full<Bytes>> {
+    if is_dav_path(path) {
+        return not_found();
+    }
     let exists = git.is_directory(path) || git.file_size(path).is_some();
     tracing::debug!(
         "  PROPFIND {:?}: depth={:?}, is_dir={}, file_size={:?}, exists={}",
@@ -302,6 +329,9 @@ async fn handle_propfind(
             tracing::debug!("    {:?}: is_dir={} len={}", name, entry_is_dir, entry_len);
         }
         for (name, entry_is_dir, entry_len) in entries {
+            if name == ".DAV" {
+                continue;
+            }
             resources.push(PropfindResource {
                 path: path.join(&name),
                 is_dir: entry_is_dir,
@@ -326,6 +356,9 @@ async fn handle_copy_move(
     git: &GitRepo,
     is_move: bool,
 ) -> Response<Full<Bytes>> {
+    if is_dav_path(path) || is_dav_path(&parse_destination(req).unwrap_or_default()) {
+        return not_found();
+    }
     let dest_path = match parse_destination(req) {
         Some(p) => p,
         None => {
@@ -337,14 +370,25 @@ async fn handle_copy_move(
     tracing::debug!(
         "  {} {:?} → {:?}: src_is_dir={} src_size={:?}, dest_exists={:?}",
         if is_move { "MOVE" } else { "COPY" },
-        path, dest_path,
+        path,
+        dest_path,
         git.is_directory(path),
         git.file_size(path),
-        if git.is_directory(&dest_path) { Some("dir") } else if git.file_size(&dest_path).is_some() { Some("file") } else { None }
+        if git.is_directory(&dest_path) {
+            Some("dir")
+        } else if git.file_size(&dest_path).is_some() {
+            Some("file")
+        } else {
+            None
+        }
     );
 
     if !git.is_directory(path) && git.file_size(path).is_none() {
-        tracing::warn!("  {} source not found: {:?}", if is_move { "MOVE" } else { "COPY" }, path);
+        tracing::warn!(
+            "  {} source not found: {:?}",
+            if is_move { "MOVE" } else { "COPY" },
+            path
+        );
         return not_found();
     }
 
@@ -361,66 +405,22 @@ async fn handle_copy_move(
         return precondition_failed();
     }
 
-    let (writes, mut deletes) = if git.is_directory(path) {
-        let entries = match git.list_dir(path) {
-            Ok(entries) => entries,
-            Err(_) => return internal_error(),
-        };
-        let writes: Vec<(PathBuf, Vec<u8>)> = entries
-            .iter()
-            .filter(|(_, is_dir, _)| !*is_dir)
-            .filter_map(|(name, _, _)| {
-                let src = path.join(name);
-                git.read_file(&src)
-                    .ok()
-                    .flatten()
-                    .map(|data| (dest_path.join(name), data))
-            })
-            .collect();
-        if is_move {
-            let deletes: Vec<PathBuf> = entries
-                .iter()
-                .filter(|(_, is_dir, _)| !*is_dir)
-                .map(|(name, _, _)| path.join(name))
-                .collect();
-            (writes, deletes)
-        } else {
-            (writes, vec![])
-        }
+    let result = if is_move {
+        git.move_subtree(path, &dest_path).await
     } else {
-        let data = match git.read_file(path) {
-            Ok(Some(d)) => d,
-            _ => return internal_error(),
-        };
-        let writes = vec![(dest_path.clone(), data)];
-        let deletes = if is_move {
-            vec![path.to_path_buf()]
-        } else {
-            vec![]
-        };
-        (writes, deletes)
+        git.copy_subtree(path, &dest_path).await
     };
 
-    if git.is_directory(&dest_path)
-        && let Ok(entries) = git.list_dir(&dest_path)
-    {
-        for (name, is_dir, _) in &entries {
-            if !is_dir {
-                deletes.push(dest_path.join(name));
-            }
-        }
-    }
-
-    match git.batch_paths(&writes, &deletes).await {
+    match result {
         Ok(_) => {
-            if is_move && git.is_directory(path) {
-                git.remove_dir_marker(path);
+            if dest_exists {
+                no_content()
+            } else {
+                created()
             }
-            // 201 if destination was created new, 204 if updated
-            if dest_exists { no_content() } else { created() }
         }
         Err(e) => {
-            tracing::error!("batch_paths for copy/move failed: {}", e);
+            tracing::error!("{} failed: {}", if is_move { "MOVE" } else { "COPY" }, e);
             internal_error()
         }
     }
@@ -559,7 +559,11 @@ fn davpath_to_rel(s: &str) -> PathBuf {
     }
 }
 
-async fn handle_proppatch(path: &Path, req: Request<Incoming>, _git: &GitRepo) -> Response<Full<Bytes>> {
+async fn handle_proppatch(
+    path: &Path,
+    req: Request<Incoming>,
+    _git: &GitRepo,
+) -> Response<Full<Bytes>> {
     // Read (and ignore) the request body — no XML parser dependency.
     // Windows Explorer uses PROPPATCH to set file timestamps after PUT.
     // Return 207 Multistatus OK so Windows doesn't error out.
