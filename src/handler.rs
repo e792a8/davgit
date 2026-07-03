@@ -53,8 +53,6 @@ pub async fn handle_request(req: Request<Incoming>, git: Arc<GitRepo>) -> Respon
         tracing::debug!("  Content-Length: {}", cl);
     }
 
-    git.refresh_if_stale().await;
-
     let rel_path = davpath_to_rel(req.uri().path());
 
     let resp = match req.method().as_str() {

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use gix_object::TreeRefIter;
@@ -16,7 +15,6 @@ use crate::git::packfile::{
 use crate::git::transport::do_fetch;
 use crate::git::transport::do_push;
 
-const FETCH_THROTTLE: Duration = Duration::from_secs(3);
 const MAX_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -32,7 +30,6 @@ pub struct GitRepo {
     password: Option<String>,
     head_oid: Mutex<Option<ObjectId>>,
     objects: Mutex<HashMap<ObjectId, Vec<u8>>>,
-    last_fetch: Mutex<Instant>,
 }
 
 impl GitRepo {
@@ -64,23 +61,10 @@ impl GitRepo {
             password: password.map(|s| s.to_owned()),
             head_oid: Mutex::new(None),
             objects: Mutex::new(HashMap::new()),
-            last_fetch: Mutex::new(Instant::now()),
         };
 
-        repo.try_fetch_and_cache(None).await;
+        repo.fetch().await?;
         Ok(repo)
-    }
-
-    /// Try to fetch fresh data and update the internal cache.
-    /// Returns true if the cache was updated.
-    pub async fn refresh_if_stale(&self) -> bool {
-        {
-            let last = self.last_fetch.lock().unwrap();
-            if last.elapsed() < FETCH_THROTTLE {
-                return false;
-            }
-        }
-        self.try_fetch_and_cache(Some(true)).await
     }
 
     /// Read a file's content. Returns `None` if the path is a directory or doesn't exist.
@@ -232,82 +216,8 @@ impl GitRepo {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
-
-    async fn try_fetch_and_cache(&self, _is_refresh: Option<bool>) -> bool {
-        let head = *self.head_oid.lock().unwrap();
-        let have: Vec<ObjectId> = head.into_iter().collect();
-        let result = match do_fetch(
-            &self.remote_url,
-            &self.branch,
-            self.ssh_key.as_deref(),
-            self.password.as_deref(),
-            Some(1),
-            &have,
-            &have,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("fetch failed: {}", e);
-                *self.last_fetch.lock().unwrap() = Instant::now();
-                return false;
-            }
-        };
-
-        if result.packfile.is_empty() {
-            tracing::debug!("fetch: no new objects (server had everything)");
-            *self.last_fetch.lock().unwrap() = Instant::now();
-            return true;
-        }
-
-        let new_objects = match parse_packfile(&result.packfile) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!("parse_packfile failed: {}", e);
-                *self.last_fetch.lock().unwrap() = Instant::now();
-                return false;
-            }
-        };
-
-        let head = result.head_commit_oid;
-
-        let tree_oid = {
-            let commit_data = match new_objects.get(&head) {
-                Some(c) => c,
-                None => {
-                    tracing::warn!("HEAD commit not found in fetched packfile");
-                    *self.last_fetch.lock().unwrap() = Instant::now();
-                    return false;
-                }
-            };
-            let commit = match gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("commit parse failed: {}", e);
-                    *self.last_fetch.lock().unwrap() = Instant::now();
-                    return false;
-                }
-            };
-            commit.tree().to_owned()
-        };
-
-        let mut merged = self.objects.lock().unwrap().clone();
-        merged.extend(new_objects);
-
-        Self::prune_objects(&mut merged, &tree_oid, &head);
-
-        *self.head_oid.lock().unwrap() = Some(head);
-        *self.objects.lock().unwrap() = merged;
-        *self.last_fetch.lock().unwrap() = Instant::now();
-
-        true
-    }
-
-    /// Fetch latest objects and return (merged_objects, head_oid, tree_oid).
-    /// Does NOT build the file contents HashMap — avoids loading all file data.
-    async fn fetch_and_merge(&self) -> Result<(HashMap<ObjectId, Vec<u8>>, ObjectId, ObjectId)> {
+    /// Fetch latest state from remote and merge into local cache.
+    async fn fetch(&self) -> Result<()> {
         let head = *self.head_oid.lock().unwrap();
         let have: Vec<ObjectId> = head.into_iter().collect();
         let result = do_fetch(
@@ -322,21 +232,8 @@ impl GitRepo {
         .await?;
 
         if result.packfile.is_empty() {
-            // No new objects from server. Use our cached state — the server's ref
-            // may have been advanced by another concurrent server, but our tree
-            // is still correct (no objects changed for us).
             tracing::debug!("fetch: no new objects, using cached state");
-            let head = self.head_oid.lock().unwrap().context("no cached HEAD")?;
-            let objects = self.objects.lock().unwrap().clone();
-            let tree_oid = {
-                let commit_data = objects
-                    .get(&head)
-                    .context("cached HEAD commit not found in objects")?;
-                let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
-                commit.tree().to_owned()
-            };
-            *self.last_fetch.lock().unwrap() = Instant::now();
-            return Ok((objects, head, tree_oid));
+            return Ok(());
         }
 
         let head = result.head_commit_oid;
@@ -355,12 +252,25 @@ impl GitRepo {
         Self::prune_objects(&mut merged, &tree_oid, &head);
 
         *self.head_oid.lock().unwrap() = Some(head);
-        *self.objects.lock().unwrap() = merged.clone();
-        *self.last_fetch.lock().unwrap() = Instant::now();
+        *self.objects.lock().unwrap() = merged;
 
-        Ok((merged, head, tree_oid))
+        Ok(())
     }
 
+    /// Get owned objects/head/tree data from the internal cache.
+    /// Call after a successful fetch().
+    fn claim_objects(&self) -> Result<(ObjectId, HashMap<ObjectId, Vec<u8>>, ObjectId)> {
+        let head = self.head_oid.lock().unwrap().context("no HEAD")?;
+        let objects = self.objects.lock().unwrap().clone();
+        let tree_oid = {
+            let commit_data = objects
+                .get(&head)
+                .context("HEAD commit not found in objects")?;
+            let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
+            commit.tree().to_owned()
+        };
+        Ok((head, objects, tree_oid))
+    }
     /// Push a commit built from tree-delta objects and cache on success.
     async fn push_with_cache(
         &self,
@@ -406,7 +316,6 @@ impl GitRepo {
                 objects.entry(oid).or_insert(data);
             }
             *self.head_oid.lock().unwrap() = Some(commit_oid);
-            *self.last_fetch.lock().unwrap() = Instant::now();
         }
 
         Ok(pushed)
@@ -467,7 +376,8 @@ impl GitRepo {
         msg: &str,
         is_move: bool,
     ) -> Result<bool> {
-        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+        self.fetch().await?;
+        let (parent_oid, mut objects, tree_oid) = self.claim_objects()?;
 
         let (tmp_root, mut tmp_objs) = if find_tree_entry(&objects, &tree_oid, dest)?.is_some() {
             let (r, o) = remove_tree_entry(&mut objects, &tree_oid, dest)?;
@@ -492,13 +402,15 @@ impl GitRepo {
     }
 
     async fn try_delete_subtree(&self, path: &Path, msg: &str) -> Result<bool> {
-        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+        self.fetch().await?;
+        let (parent_oid, mut objects, tree_oid) = self.claim_objects()?;
         let (new_root, objs) = remove_tree_entry(&mut objects, &tree_oid, path)?;
         self.push_with_cache(parent_oid, new_root, objs, msg).await
     }
 
     async fn try_create_dir(&self, path: &Path, msg: &str) -> Result<bool> {
-        let (mut objects, parent_oid, tree_oid) = self.fetch_and_merge().await?;
+        self.fetch().await?;
+        let (parent_oid, mut objects, tree_oid) = self.claim_objects()?;
         let dav_path = path.join(".DAV");
         let blob_oid = hash_object(OBJ_BLOB, b"");
         objects.insert(blob_oid, b"".to_vec());
@@ -521,7 +433,8 @@ impl GitRepo {
         deletes: &[PathBuf],
         message: &str,
     ) -> Result<bool> {
-        let (mut objects, parent_oid, mut tree_oid) = self.fetch_and_merge().await?;
+        self.fetch().await?;
+        let (parent_oid, mut objects, mut tree_oid) = self.claim_objects()?;
         let mut pack_objects = Vec::new();
 
         for (path, data) in writes {
