@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use gix_object::{Tree, TreeRefIter, WriteTo, tree};
@@ -7,51 +7,40 @@ use gix_object::{Tree, TreeRefIter, WriteTo, tree};
 use crate::git::packfile::{OBJ_TREE, ObjectId, hash_object};
 
 type ObjectList = Vec<(u8, Vec<u8>)>;
-type IndexContents = (HashMap<PathBuf, ObjectId>, HashMap<PathBuf, Vec<u8>>);
 
 // ---------------------------------------------------------------------------
 // Tree walking
 // ---------------------------------------------------------------------------
 
-/// Walk a tree and build both a path→OID index and a path→content map.
-pub fn build_index_and_contents(
+/// Recursively collect all OIDs (both tree and blob) reachable from `tree_oid`.
+pub fn collect_all_oids(
     objects: &HashMap<ObjectId, Vec<u8>>,
     tree_oid: &ObjectId,
-) -> Result<IndexContents> {
-    let mut index = HashMap::new();
-    let mut contents = HashMap::new();
-    walk_rec(objects, tree_oid, Path::new(""), &mut index, &mut contents)?;
-    Ok((index, contents))
+) -> HashSet<ObjectId> {
+    let mut result = HashSet::new();
+    collect_all_rec(objects, tree_oid, &mut result);
+    result
 }
 
-fn walk_rec(
+fn collect_all_rec(
     objects: &HashMap<ObjectId, Vec<u8>>,
     tree_oid: &ObjectId,
-    base: &Path,
-    index: &mut HashMap<PathBuf, ObjectId>,
-    contents: &mut HashMap<PathBuf, Vec<u8>>,
-) -> Result<()> {
-    let tree_data = objects
-        .get(tree_oid)
-        .with_context(|| format!("missing tree object {}", tree_oid))?;
-
-    let iter = TreeRefIter::from_bytes(tree_data, gix_hash::Kind::Sha1);
-    for entry in iter {
-        let entry = entry?;
-        let name = std::str::from_utf8(entry.filename)?;
-        let path = base.join(name);
-
-        let entry_oid: ObjectId = entry.oid.to_owned();
-        if entry.mode.is_tree() {
-            walk_rec(objects, &entry_oid, &path, index, contents)?;
-        } else {
-            index.insert(path.clone(), entry_oid);
-            if let Some(data) = objects.get(&entry_oid) {
-                contents.insert(path, data.to_vec());
+    result: &mut HashSet<ObjectId>,
+) {
+    if !result.insert(*tree_oid) {
+        return;
+    }
+    if let Some(tree_data) = objects.get(tree_oid) {
+        let iter = TreeRefIter::from_bytes(tree_data, gix_hash::Kind::Sha1);
+        for entry in iter.flatten() {
+            let entry_oid = entry.oid.to_owned();
+            if entry.mode.is_tree() {
+                collect_all_rec(objects, &entry_oid, result);
+            } else {
+                result.insert(entry_oid);
             }
         }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -104,34 +93,6 @@ pub fn find_tree_entry(
     }
 
     Ok(Some((tree::EntryKind::Tree.into(), current)))
-}
-
-/// Recursively collect all tree OIDs reachable from the root tree.
-pub fn collect_tree_oids(
-    objects: &HashMap<ObjectId, Vec<u8>>,
-    tree_oid: &ObjectId,
-) -> HashSet<ObjectId> {
-    let mut result = HashSet::new();
-    collect_tree_oids_rec(objects, tree_oid, &mut result);
-    result
-}
-
-fn collect_tree_oids_rec(
-    objects: &HashMap<ObjectId, Vec<u8>>,
-    tree_oid: &ObjectId,
-    result: &mut HashSet<ObjectId>,
-) {
-    if !result.insert(*tree_oid) {
-        return;
-    }
-    if let Some(tree_data) = objects.get(tree_oid) {
-        let iter = TreeRefIter::from_bytes(tree_data, gix_hash::Kind::Sha1);
-        for entry in iter.flatten() {
-            if entry.mode.is_tree() {
-                collect_tree_oids_rec(objects, &entry.oid.to_owned(), result);
-            }
-        }
-    }
 }
 
 /// Recursively modify the tree entry at `path` under `tree_oid`.

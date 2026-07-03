@@ -4,9 +4,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use gix_object::TreeRefIter;
 
 use crate::git::objects::{
-    build_commit, build_index_and_contents, copy_tree_entry, find_tree_entry, modify_tree_entry,
+    build_commit, collect_all_oids, copy_tree_entry, find_tree_entry, modify_tree_entry,
     remove_tree_entry,
 };
 use crate::git::packfile::{
@@ -31,7 +32,6 @@ pub struct GitRepo {
     password: Option<String>,
     head_oid: Mutex<Option<ObjectId>>,
     objects: Mutex<HashMap<ObjectId, Vec<u8>>>,
-    index: Mutex<HashMap<PathBuf, ObjectId>>,
     last_fetch: Mutex<Instant>,
 }
 
@@ -64,7 +64,6 @@ impl GitRepo {
             password: password.map(|s| s.to_owned()),
             head_oid: Mutex::new(None),
             objects: Mutex::new(HashMap::new()),
-            index: Mutex::new(HashMap::new()),
             last_fetch: Mutex::new(Instant::now()),
         };
 
@@ -86,77 +85,103 @@ impl GitRepo {
 
     /// Read a file's content. Returns `None` if the path is a directory or doesn't exist.
     pub fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        let index = self.index.lock().unwrap();
-        match index.get(path) {
-            Some(oid) => {
-                let objects = self.objects.lock().unwrap();
-                Ok(objects.get(oid).cloned())
-            }
-            None => Ok(None),
+        let Some(head) = *self.head_oid.lock().unwrap() else {
+            bail!("repo head is None")
+        };
+        let objects = self.objects.lock().unwrap();
+        let Some(commit_data) = objects.get(&head) else {
+            return Ok(None);
+        };
+        let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
+        let tree_oid = commit.tree().to_owned();
+        match find_tree_entry(&objects, &tree_oid, path)? {
+            Some((mode, oid)) if !mode.is_tree() => Ok(objects.get(&oid).cloned()),
+            _ => Ok(None),
         }
     }
 
     /// List entries in a directory: (name, is_dir, size).
     /// Returns empty vec for non-existent paths.
     pub fn list_dir(&self, path: &Path) -> Result<Vec<(String, bool, u64)>> {
-        let index = self.index.lock().unwrap();
-        let objects = self.objects.lock().unwrap();
-
-        let prefix = if path.as_os_str().is_empty() {
-            PathBuf::new()
-        } else {
-            let mut p = path.to_path_buf();
-            p.push("");
-            p
+        let head = match *self.head_oid.lock().unwrap() {
+            Some(h) => h,
+            None => return Ok(vec![]),
         };
-
-        let mut entries: Vec<(String, bool, u64)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for key in index.keys() {
-            if let Ok(rel) = key.strip_prefix(&prefix) {
-                if rel.as_os_str().is_empty() {
-                    continue;
-                }
-                let first = rel.components().next().unwrap();
-                let name = first.as_os_str().to_string_lossy().to_string();
-                if seen.contains(&name) {
-                    continue;
-                }
-                seen.insert(name.clone());
-
-                let is_dir = rel.components().count() > 1;
-                let len = if is_dir {
-                    0
-                } else if let Some(oid) = index.get(key) {
-                    objects.get(oid).map(|d| d.len() as u64).unwrap_or(0)
-                } else {
-                    0
-                };
-                entries.push((name, is_dir, len));
-            }
+        let objects = self.objects.lock().unwrap();
+        let tree_oid = {
+            let commit_data = match objects.get(&head) {
+                Some(d) => d,
+                None => return Ok(vec![]),
+            };
+            let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1)?;
+            commit.tree().to_owned()
+        };
+        let dir_oid = match find_tree_entry(&objects, &tree_oid, path)? {
+            Some((mode, oid)) if mode.is_tree() => oid,
+            _ => return Ok(vec![]),
+        };
+        let tree_data = match objects.get(&dir_oid) {
+            Some(d) => d,
+            None => return Ok(vec![]),
+        };
+        let mut entries = Vec::new();
+        for entry in TreeRefIter::from_bytes(tree_data, gix_hash::Kind::Sha1).flatten() {
+            let name = match std::str::from_utf8(entry.filename) {
+                Ok(n) => n.to_owned(),
+                Err(_) => continue,
+            };
+            let is_dir = entry.mode.is_tree();
+            let len = if is_dir {
+                0
+            } else {
+                objects
+                    .get(&entry.oid.to_owned())
+                    .map(|d| d.len() as u64)
+                    .unwrap_or(0)
+            };
+            entries.push((name, is_dir, len));
         }
-
         Ok(entries)
     }
 
     /// Check if a path is a directory.
     pub fn is_directory(&self, path: &Path) -> bool {
         if path.as_os_str().is_empty() {
-            return true; // root is always a directory
+            return true;
         }
-        let index = self.index.lock().unwrap();
-        // A directory exists if any index key (other than the path itself)
-        // starts with this path.
-        index.keys().any(|k| k != path && k.starts_with(path))
+        let head = match *self.head_oid.lock().unwrap() {
+            Some(h) => h,
+            None => return false,
+        };
+        let objects = self.objects.lock().unwrap();
+        let commit_data = match objects.get(&head) {
+            Some(d) => d,
+            None => return false,
+        };
+        let commit = match gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let tree_oid = commit.tree().to_owned();
+        match find_tree_entry(&objects, &tree_oid, path) {
+            Ok(Some((mode, _))) => mode.is_tree(),
+            _ => false,
+        }
     }
 
     /// Get the content length of a file.
     pub fn file_size(&self, path: &Path) -> Option<u64> {
-        let index = self.index.lock().unwrap();
-        let oid = index.get(path)?;
+        let head = (*self.head_oid.lock().unwrap())?;
         let objects = self.objects.lock().unwrap();
-        objects.get(oid).map(|d| d.len() as u64)
+        let commit_data = objects.get(&head)?;
+        let commit = gix_object::CommitRef::from_bytes(commit_data, gix_hash::Kind::Sha1).ok()?;
+        let tree_oid = commit.tree().to_owned();
+        let (mode, oid) = find_tree_entry(&objects, &tree_oid, path).ok()??;
+        if mode.is_tree() {
+            None
+        } else {
+            objects.get(&oid).map(|d| d.len() as u64)
+        }
     }
 
     /// Create a directory by committing a ".DAV" marker file in it.
@@ -271,20 +296,10 @@ impl GitRepo {
         let mut merged = self.objects.lock().unwrap().clone();
         merged.extend(new_objects);
 
-        let (index, _contents) = match build_index_and_contents(&merged, &tree_oid) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("build_index failed: {}", e);
-                *self.last_fetch.lock().unwrap() = Instant::now();
-                return false;
-            }
-        };
-
-        Self::prune_objects(&mut merged, &index, &tree_oid, &head);
+        Self::prune_objects(&mut merged, &tree_oid, &head);
 
         *self.head_oid.lock().unwrap() = Some(head);
         *self.objects.lock().unwrap() = merged;
-        *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
 
         true
@@ -337,12 +352,10 @@ impl GitRepo {
             commit.tree().to_owned()
         };
 
-        let (index, _) = build_index_and_contents(&merged, &tree_oid)?;
-        Self::prune_objects(&mut merged, &index, &tree_oid, &head);
+        Self::prune_objects(&mut merged, &tree_oid, &head);
 
         *self.head_oid.lock().unwrap() = Some(head);
         *self.objects.lock().unwrap() = merged.clone();
-        *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
 
         Ok((merged, head, tree_oid))
@@ -392,8 +405,6 @@ impl GitRepo {
                 let oid = hash_object(kind, &data);
                 objects.entry(oid).or_insert(data);
             }
-            let (new_index, _) = build_index_and_contents(&objects, &new_root_oid)?;
-            *self.index.lock().unwrap() = new_index;
             *self.head_oid.lock().unwrap() = Some(commit_oid);
             *self.last_fetch.lock().unwrap() = Instant::now();
         }
@@ -402,22 +413,14 @@ impl GitRepo {
     }
 
     /// Prune the objects map to keep only what's needed by the current tree
-    /// plus known OIDs for future shallow/have commands.
-    /// Also keeps all reachable subtree tree OIDs for tree-based COPY/MOVE.
+    /// and the HEAD commit.
     fn prune_objects(
         objects: &mut HashMap<ObjectId, Vec<u8>>,
-        index: &HashMap<PathBuf, ObjectId>,
         tree_oid: &ObjectId,
         head: &ObjectId,
     ) {
-        let all_tree_oids = crate::git::objects::collect_tree_oids(objects, tree_oid);
-        let needed: HashSet<ObjectId> = index
-            .values()
-            .copied()
-            .chain(std::iter::once(*tree_oid))
-            .chain(std::iter::once(*head))
-            .chain(all_tree_oids)
-            .collect();
+        let mut needed = collect_all_oids(objects, tree_oid);
+        needed.insert(*head);
         objects.retain(|k, _| needed.contains(k));
     }
 
