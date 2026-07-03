@@ -33,7 +33,6 @@ pub struct GitRepo {
     objects: Mutex<HashMap<ObjectId, Vec<u8>>>,
     index: Mutex<HashMap<PathBuf, ObjectId>>,
     last_fetch: Mutex<Instant>,
-    known_oids: Mutex<Vec<ObjectId>>,
 }
 
 impl GitRepo {
@@ -67,7 +66,6 @@ impl GitRepo {
             objects: Mutex::new(HashMap::new()),
             index: Mutex::new(HashMap::new()),
             last_fetch: Mutex::new(Instant::now()),
-            known_oids: Mutex::new(Vec::new()),
         };
 
         repo.try_fetch_and_cache(None).await;
@@ -211,15 +209,16 @@ impl GitRepo {
     // -----------------------------------------------------------------------
 
     async fn try_fetch_and_cache(&self, _is_refresh: Option<bool>) -> bool {
-        let known = self.known_oids.lock().unwrap().clone();
+        let head = *self.head_oid.lock().unwrap();
+        let have: Vec<ObjectId> = head.into_iter().collect();
         let result = match do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
             Some(1),
-            &known,
-            &known,
+            &have,
+            &have,
         )
         .await
         {
@@ -281,19 +280,12 @@ impl GitRepo {
             }
         };
 
-        Self::prune_objects(&mut merged, &index, &tree_oid, &head, &known);
+        Self::prune_objects(&mut merged, &index, &tree_oid, &head);
 
         *self.head_oid.lock().unwrap() = Some(head);
         *self.objects.lock().unwrap() = merged;
         *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
-
-        {
-            let mut known = self.known_oids.lock().unwrap();
-            if !known.contains(&head) {
-                known.push(head);
-            }
-        }
 
         true
     }
@@ -301,15 +293,16 @@ impl GitRepo {
     /// Fetch latest objects and return (merged_objects, head_oid, tree_oid).
     /// Does NOT build the file contents HashMap — avoids loading all file data.
     async fn fetch_and_merge(&self) -> Result<(HashMap<ObjectId, Vec<u8>>, ObjectId, ObjectId)> {
-        let known = self.known_oids.lock().unwrap().clone();
+        let head = *self.head_oid.lock().unwrap();
+        let have: Vec<ObjectId> = head.into_iter().collect();
         let result = do_fetch(
             &self.remote_url,
             &self.branch,
             self.ssh_key.as_deref(),
             self.password.as_deref(),
             Some(1),
-            &known,
-            &known,
+            &have,
+            &have,
         )
         .await?;
 
@@ -345,17 +338,12 @@ impl GitRepo {
         };
 
         let (index, _) = build_index_and_contents(&merged, &tree_oid)?;
-        Self::prune_objects(&mut merged, &index, &tree_oid, &head, &known);
+        Self::prune_objects(&mut merged, &index, &tree_oid, &head);
 
         *self.head_oid.lock().unwrap() = Some(head);
         *self.objects.lock().unwrap() = merged.clone();
         *self.index.lock().unwrap() = index;
         *self.last_fetch.lock().unwrap() = Instant::now();
-
-        let mut known = self.known_oids.lock().unwrap();
-        if !known.contains(&head) {
-            known.push(head);
-        }
 
         Ok((merged, head, tree_oid))
     }
@@ -421,7 +409,6 @@ impl GitRepo {
         index: &HashMap<PathBuf, ObjectId>,
         tree_oid: &ObjectId,
         head: &ObjectId,
-        known: &[ObjectId],
     ) {
         let all_tree_oids = crate::git::objects::collect_tree_oids(objects, tree_oid);
         let needed: HashSet<ObjectId> = index
@@ -429,7 +416,6 @@ impl GitRepo {
             .copied()
             .chain(std::iter::once(*tree_oid))
             .chain(std::iter::once(*head))
-            .chain(known.iter().copied())
             .chain(all_tree_oids)
             .collect();
         objects.retain(|k, _| needed.contains(k));
